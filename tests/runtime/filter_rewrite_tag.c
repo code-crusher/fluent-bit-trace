@@ -24,8 +24,10 @@
 #include <fluent-bit/flb_input_chunk.h>
 #include <fluent-bit/flb_log_event_decoder.h>
 #include <fluent-bit/flb_log_event_encoder.h>
+#include <chunkio/cio_utils.h>
 #include <msgpack.h>
 #include "flb_tests_runtime.h"
+#include "../include/flb_tests_tmpdir.h"
 
 struct filter_test {
     flb_ctx_t *flb;    /* Fluent Bit library context */
@@ -441,6 +443,95 @@ static void flb_test_busy_emitter_keeps_original()
     }
 
     filter_test_destroy(ctx);
+}
+
+/*
+ * https://github.com/fluent/fluent-bit/issues/12667
+ *
+ * When the emitter mem_buf_limit is hit, in_emitter_add_record() used to
+ * reject the rewrite (FLB_EMITTER_BUSY), so rewrite_tag kept the original
+ * tag. With an output that only matches the rewritten tag those records
+ * were never delivered, even though the emitter (and the input) used
+ * filesystem buffering: a filesystem emitter must queue the rewrites
+ * instead of dropping them, so every record is delivered under the new tag.
+ */
+static void flb_test_busy_emitter_delivers_all_on_filesystem()
+{
+    struct flb_lib_out_cb cb_data;
+    struct filter_test *ctx;
+    char *storage_path;
+    int ret;
+    int not_used = 0;
+    int bytes;
+    int heavy_loop = 100000;
+    int got;
+    char p[256];
+    int i;
+
+    cb_data.cb = cb_count_msgpack;
+    cb_data.data = &not_used;
+
+    ctx = filter_test_create((void *) &cb_data);
+    if (!ctx) {
+        exit(EXIT_FAILURE);
+    }
+    clear_output_num();
+
+    /* Filesystem buffering for the service, input and emitter */
+    storage_path = flb_test_tmpdir_cat("/flb-rt-rewrite-tag-12667-XXXXXX");
+    TEST_CHECK(storage_path != NULL);
+    if (mkdtemp(storage_path) == NULL) {
+        TEST_CHECK("mkdtemp" != NULL);
+        flb_free(storage_path);
+        filter_test_destroy(ctx);
+        return;
+    }
+    ret = flb_service_set(ctx->flb, "storage.path", storage_path, NULL);
+    TEST_CHECK(ret == 0);
+    ret = flb_input_set(ctx->flb, ctx->i_ffd, "storage.type", "filesystem", NULL);
+    TEST_CHECK(ret == 0);
+
+    ret = flb_filter_set(ctx->flb, ctx->f_ffd,
+                         "Rule", "$key ^(rewrite)$ updated false",
+                         "Emitter_Mem_Buf_Limit", "1kb",
+                         "emitter_storage.type", "filesystem",
+                         NULL);
+    TEST_CHECK(ret == 0);
+
+    /* Only the rewritten tag is routed to the output */
+    ret = flb_output_set(ctx->flb, ctx->o_ffd,
+                         "Match", "updated",
+                         NULL);
+    TEST_CHECK(ret == 0);
+
+    ret = flb_service_set(ctx->flb, "Log_Level", "Off", NULL);
+    TEST_CHECK(ret == 0);
+
+    ret = flb_start(ctx->flb);
+    TEST_CHECK(ret == 0);
+
+    for (i = 0; i < heavy_loop; i++) {
+        memset(p, '\0', sizeof(p));
+        snprintf(p, sizeof(p), "[%d, {\"val\": \"%d\",\"key\": \"rewrite\"}]", i, i);
+        bytes = flb_lib_push(ctx->flb, ctx->i_ffd, p, strlen(p));
+        TEST_CHECK(bytes == strlen(p));
+    }
+
+    /*
+     * Every pushed record must be re-emitted under the 'updated' tag once
+     * the emitter has drained its queue: filesystem buffering means no
+     * rewrite may be dropped for hitting the emitter memory limit.
+     */
+    wait_for_output_num(60000, heavy_loop, &got);
+
+    if (!TEST_CHECK(got == heavy_loop)) {
+        TEST_MSG("expect: %d got: %d", heavy_loop, got);
+    }
+
+    filter_test_destroy(ctx);
+
+    cio_utils_recursive_delete(storage_path);
+    flb_free(storage_path);
 }
 
 static void flb_test_issue_4793()
@@ -957,6 +1048,8 @@ TEST_LIST = {
     {"keep_true",        flb_test_keep_true},
     {"heavy_input_pause_emitter", flb_test_heavy_input_pause_emitter},
     {"busy_emitter_keeps_original", flb_test_busy_emitter_keeps_original},
+    {"busy_emitter_delivers_all_on_filesystem",
+     flb_test_busy_emitter_delivers_all_on_filesystem},
     {"issue_4518", flb_test_issue_4518},
     {"issue_4793", flb_test_issue_4793},
     {"sigsegv_issue_5846", flb_test_issue_5846},

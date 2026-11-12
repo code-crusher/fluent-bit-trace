@@ -243,6 +243,42 @@ def test_emitter_backpressure_keeps_records_and_resumes_input(tmp_path, retry_si
     assert Counter(r["id"] for r in records(service)) == Counter(range(25))
 
 
+def test_filesystem_emitter_mem_limit_still_rewrites_all_records(tmp_path, retry_sink):
+    # https://github.com/fluent/fluent-bit/issues/12667: hitting the emitter
+    # mem_buf_limit used to drop the rewrite and keep the original tag, so an
+    # output matching only the rewritten tag never saw those records. With a
+    # filesystem emitter every rewrite must be queued and delivered.
+    rewrite = {"name": "rewrite_tag", "emitter_name": "bounded_fs_emitter",
+               "emitter_mem_buf_limit": "1K", "emitter_storage.type": "filesystem",
+               "rule": "$kind ^emit$ routed false"}
+    config = config_for(tmp_path, [], rewrite)
+    config["pipeline"]["inputs"] = [{
+        "name": "http", "listen": "127.0.0.1", "port": "${FLUENT_BIT_TEST_LISTENER_PORT}",
+        "storage.type": "filesystem",
+    }]
+    add_retry_output(config, retry_sink)
+    # Only the rewritten tag is routed: nothing may keep its original tag.
+    config["pipeline"]["outputs"] = [config["pipeline"]["outputs"][-1]]
+    service = service_for(tmp_path, config)
+    retry_sink.allow.set()
+    try:
+        service.start()
+        url = f"http://127.0.0.1:{service.flb_listener_port}/source.app"
+        messages = [{"id": i, "kind": "emit", "padding": "x" * 200} for i in range(64)]
+        response = requests.post(url, json=messages, timeout=15)
+        assert response.status_code == 201, response.text
+        # Far above the 1K emitter limit: records must queue on disk, not be
+        # dropped from the rewrite.
+        service.wait_for_condition(
+            lambda: Counter(retry_sink.received) == Counter(range(64)),
+            timeout=60, description="every rewrite delivered under the emitter mem limit",
+        )
+    finally:
+        retry_sink.allow.set()
+        service.stop()
+    assert Counter(retry_sink.received) == Counter(range(64))
+
+
 def test_filesystem_emitter_backlog_replays_with_live_records(tmp_path, retry_sink):
     rewrite = {"name": "rewrite_tag", "emitter_name": "persistent_emitter",
                "emitter_storage.type": "filesystem", "rule": "$kind ^emit$ routed false"}

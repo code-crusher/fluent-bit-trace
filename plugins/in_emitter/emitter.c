@@ -280,14 +280,31 @@ int in_emitter_add_record(const char *tag, int tag_len,
      * A callback-owning filter cannot retry its in-flight batch. Allow one
      * input-chunk-sized pending batch while normal chunk accounting pauses
      * the emitter, but retain a hard bound under sustained backpressure.
+     *
+     * A filesystem-backed emitter must never reject a rewrite here. The
+     * memory limit would otherwise silently skip the rewrite_tag processing:
+     * the caller keeps the record under its original tag, so any output that
+     * only matches the rewritten tag never receives it (issue #12667). The
+     * normal chunk accounting never pauses a filesystem input on the memory
+     * limit (flb_input_chunk_protect() skips mem pauses for FLB_STORAGE_FS
+     * and stale chunks are set down), so rejecting records does not relieve
+     * the pressure either. Queue the record instead and let the collector
+     * publish it into a filesystem chunk. Sustained backpressure is still
+     * bounded by storage.pause_on_chunks_overlimit, enabled by default for
+     * filesystem emitters.
      */
     if (shutdown_flush_enabled(ctx) == FLB_FALSE &&
         is_queue_overlimit(ctx, buf_size) == FLB_TRUE &&
         (ctx->owner_flush_enabled == FLB_FALSE ||
          is_owner_queue_overlimit(ctx, buf_size) == FLB_TRUE)) {
+        if (ctx->ins->storage_type != FLB_STORAGE_FS) {
+            flb_plg_debug(ctx->ins,
+                          "emitter memory buffer limit reached. Not accepting record.");
+            return FLB_EMITTER_BUSY;
+        }
         flb_plg_debug(ctx->ins,
-                      "emitter memory buffer limit reached. Not accepting record.");
-        return FLB_EMITTER_BUSY;
+                      "emitter memory buffer limit reached. Queueing record for "
+                      "filesystem storage.");
     }
 
     /* Check if any target chunk already exists */
