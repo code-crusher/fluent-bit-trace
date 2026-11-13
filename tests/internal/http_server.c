@@ -1168,6 +1168,64 @@ void test_http1_fragmented_header_limit(void)
     check_http1_fragmented_header_limit(8 * 1024);
 }
 
+/*
+ * Unknown headers beyond MK_HEADER_EXTRA_SIZE are a parser error. The HTTP
+ * server must report it as a bad request so a status line can be written
+ * before the connection is closed.
+ */
+void test_http1_rejects_excess_unknown_headers(void)
+{
+    struct flb_http_server server;
+    struct flb_http_server_session *session;
+    char request[8192];
+    size_t offset;
+    int unknown_headers;
+    int index;
+    int result;
+
+    memset(&server, 0, sizeof(server));
+    server.buffer_max_size = HTTP_SERVER_MAXIMUM_BUFFER_SIZE;
+
+    for (unknown_headers = MK_HEADER_EXTRA_SIZE;
+         unknown_headers <= MK_HEADER_EXTRA_SIZE + 1;
+         unknown_headers++) {
+        offset = (size_t) snprintf(request, sizeof(request),
+                                   "POST / HTTP/1.1\r\n"
+                                   "Host: localhost\r\n"
+                                   "Content-Type: application/json\r\n");
+        for (index = 0; index < unknown_headers; index++) {
+            offset += (size_t) snprintf(request + offset,
+                                        sizeof(request) - offset,
+                                        "X-H%d: v\r\n", index);
+        }
+        snprintf(request + offset, sizeof(request) - offset,
+                 "Content-Length: 7\r\n"
+                 "\r\n"
+                 "{\"a\":1}");
+
+        session = flb_http_server_session_create(HTTP_PROTOCOL_VERSION_11);
+        if (!TEST_CHECK(session != NULL)) {
+            return;
+        }
+        session->parent = &server;
+
+        result = flb_http_server_session_ingest(session,
+                                                (unsigned char *) request,
+                                                strlen(request));
+
+        if (unknown_headers == MK_HEADER_EXTRA_SIZE) {
+            TEST_CHECK(result == HTTP_SERVER_SUCCESS);
+            TEST_CHECK(session->http1.stream.status == HTTP_STREAM_STATUS_READY);
+        }
+        else {
+            TEST_CHECK(result == HTTP_SERVER_BAD_REQUEST);
+            TEST_CHECK(session->http1.stream.status == HTTP_STREAM_STATUS_ERROR);
+        }
+
+        flb_http_server_session_destroy(session);
+    }
+}
+
 static void test_http_body_inflation_budget(void)
 {
     struct flb_http_request request = {0};
@@ -1333,6 +1391,8 @@ TEST_LIST = {
     { "http1_rejects_invalid_partial_request_line", test_http1_rejects_invalid_partial_request_line },
     { "http1_header_limit_binary_units", test_http1_header_limit_binary_units },
     { "http1_fragmented_header_limit", test_http1_fragmented_header_limit },
+    { "http1_rejects_excess_unknown_headers",
+      test_http1_rejects_excess_unknown_headers },
     { "http_server_accept_reaps_stale_sessions_with_limit",
       test_http_server_accept_reaps_stale_sessions_with_limit },
     { "http_server_managed_accept_defers_uncapped_reaping",
