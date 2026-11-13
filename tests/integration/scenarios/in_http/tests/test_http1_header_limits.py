@@ -90,6 +90,27 @@ def test_http1_header_limit(listener, fragment, case):
         assert response(sock) == 200
 
 
+@pytest.mark.parametrize("unknown_headers", [50, 51, 52])
+def test_http1_unknown_header_limit(listener, unknown_headers):
+    """Reject excess unknown headers with a status line, not a silent close."""
+    body = b'{"message":"test"}'
+    request = (
+        b"POST / HTTP/1.1\r\n"
+        b"Host: localhost\r\n"
+        b"Content-Type: application/json\r\n"
+    )
+    for index in range(unknown_headers):
+        request += f"X-H{index}: v\r\n".encode()
+    request += f"Content-Length: {len(body)}\r\n\r\n".encode() + body
+
+    with socket.create_connection(("127.0.0.1", listener), timeout=5) as sock:
+        sock.sendall(request)
+        if unknown_headers <= 50:
+            assert response(sock) == 201
+        else:
+            assert response(sock) == 400
+
+
 @pytest.mark.parametrize("chunked", [False, True])
 def test_http1_fragmented_headers_and_large_body(listener, chunked):
     body = b'{"message":"' + b'a' * (2 * MAX_HEADERS) + b'"}'
