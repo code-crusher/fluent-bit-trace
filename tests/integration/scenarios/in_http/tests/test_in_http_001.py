@@ -342,6 +342,122 @@ def test_in_http_accepts_post_with_empty_generic_headers():
     assert forwarded_payloads[0][0]["message"] == "empty-header"
 
 
+def test_in_http_connection_close_request_closes_connection_promptly():
+    """
+    A request carrying 'Connection: close' must be answered with a response
+    advertising 'Connection: close', and the server must close the socket
+    immediately instead of idling until the IO timeout (issue #12655).
+    """
+    service = Service("in_http_config")
+    body = b'{"message":"connection-close"}'
+    request = (
+        b"POST / HTTP/1.1\r\n"
+        b"Host: localhost\r\n"
+        b"Content-Type: application/json\r\n"
+        + f"Content-Length: {len(body)}\r\n".encode()
+        + b"Connection: close\r\n"
+        b"\r\n"
+        + body
+    )
+
+    response = bytearray()
+    closed_at = None
+
+    try:
+        service.start()
+
+        with socket.create_connection(
+            ("127.0.0.1", service.flb_listener_port), timeout=2
+        ) as connection:
+            connection.settimeout(2)
+            connection.sendall(request)
+
+            started = time.monotonic()
+
+            while b"\r\n\r\n" not in response:
+                data = connection.recv(4096 - len(response))
+                if not data:
+                    break
+                response.extend(data)
+
+            # The response must advertise the imminent close.
+            assert b"HTTP/1.1 201" in bytes(response)
+
+            header_block = bytes(response).split(b"\r\n\r\n", 1)[0]
+            connection_close_headers = [
+                line
+                for line in header_block.split(b"\r\n")
+                if line.lower().startswith(b"connection:")
+            ]
+            assert connection_close_headers, (
+                f"response does not advertise 'Connection: close': {header_block!r}"
+            )
+            assert (
+                b"close" in connection_close_headers[0].lower()
+            ), connection_close_headers[0]
+
+            # The server must close the socket promptly, well before the
+            # default 10 second idle timeout.
+            connection.settimeout(5)
+            while True:
+                data = connection.recv(4096)
+                if not data:
+                    closed_at = time.monotonic() - started
+                    break
+                response.extend(data)
+    finally:
+        service.stop()
+
+    assert closed_at is not None, "server did not close the connection"
+    assert closed_at < 5, f"close took {closed_at:.2f}s, expected prompt close"
+
+
+def assert_connection_stays_open(sock, probe_seconds=1.0):
+    """
+    Fail if the peer closes the socket within the probe window.
+    """
+    sock.settimeout(probe_seconds)
+
+    try:
+        data = sock.recv(1)
+    except socket.timeout:
+        return
+
+    if not data:
+        pytest.fail("HTTP server closed a keep-alive connection")
+
+    pytest.fail(
+        f"HTTP server sent unexpected data on an idle keep-alive connection: {data!r}"
+    )
+
+
+def test_in_http_keepalive_request_leaves_connection_open():
+    """
+    Without 'Connection: close' an HTTP/1.1 connection must stay open after the
+    response (keep-alive is the default), so the close fix did not become a
+    'close every connection' regression.
+    """
+    service = Service("in_http_config")
+    connection = None
+
+    try:
+        service.start()
+        connection = create_connection("127.0.0.1", service.flb_listener_port)
+
+        post_json(connection, "keepalive-first-request")
+
+        # Reuse the same connection for a second request: this only works if
+        # the server kept the connection open after the first response.
+        post_json(connection, "keepalive-second-request")
+
+        # And no response header should have announced a close.
+        assert_connection_stays_open(connection.sock)
+    finally:
+        if connection is not None:
+            connection.close()
+        service.stop()
+
+
 @pytest.mark.parametrize("workers", [1, 4], ids=["single_listener", "workers_4"])
 def test_in_http_idle_timeout_keeps_completed_connections_quiet(workers):
     service = Service(
