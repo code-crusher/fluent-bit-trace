@@ -425,6 +425,15 @@ static int flb_http_server_should_connection_be_closed(
         keepalive = FLB_TRUE;
     }
 
+    /*
+     * An explicit 'Connection: close' asks the server to tear the connection
+     * down once the response has been sent, regardless of the protocol default.
+     */
+    if (connection_header_value &&
+        strncasecmp(connection_header_value, "close", 5) == 0) {
+        keepalive = FLB_FALSE;
+    }
+
     if (keepalive) {
         return FLB_FALSE;
     }
@@ -553,6 +562,26 @@ static int flb_http_server_client_activity_event_handler(void *data)
 
         response = flb_http_response_begin(session, stream);
 
+        /*
+         * Decide whether the connection will be closed before the response is
+         * committed, so the response can advertise 'Connection: close' to the
+         * client. The decision is sticky: once a request asks for the
+         * connection to be closed, every remaining response in the batch
+         * advertises the close and the connection is torn down at the end.
+         */
+        if (close_connection ||
+            flb_http_server_should_connection_be_closed(request) == FLB_TRUE) {
+            close_connection = FLB_TRUE;
+
+            if (session->version != HTTP_PROTOCOL_VERSION_20) {
+                flb_http_response_set_header(response,
+                                             "connection",
+                                             0,
+                                             "close",
+                                             0);
+            }
+        }
+
         if (request->body != NULL && request->content_length == 0) {
             request->content_length = cfl_sds_len(request->body);
         }
@@ -590,8 +619,6 @@ static int flb_http_server_client_activity_event_handler(void *data)
         }
 
 request_complete:
-        close_connection = flb_http_server_should_connection_be_closed(request);
-
         if (session->version == HTTP_PROTOCOL_VERSION_20) {
             /* nghttp2 might still need the response (deferred DATA) */
             flb_http2_server_stream_release(stream);
