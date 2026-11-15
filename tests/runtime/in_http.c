@@ -1273,6 +1273,82 @@ void test_http_add_remote_addr(char *input, char *xff_content, char *expected_ip
     test_ctx_destroy(ctx);
 }
 
+/*
+ * Regression test for issue 12656: a request carrying both
+ * Transfer-Encoding: chunked and Content-Length must be parsed as
+ * chunked (RFC 9112, section 6.3). The Content-Length branch used to
+ * shadow the chunked path, so the request never completed.
+ */
+void flb_test_http_chunked_with_content_length(void)
+{
+    struct flb_lib_out_cb cb_data;
+    struct test_ctx *ctx;
+    int ret;
+    int num;
+    char response[256];
+    int response_length;
+    char request[512];
+    const char *body = "{\"test\":\"msg\"}";
+    const char *request_template =
+        "POST / HTTP/1.1\r\n"
+        "Host: 127.0.0.1\r\n"
+        "Content-Type: application/json\r\n"
+        "Transfer-Encoding: chunked\r\n"
+        "Content-Length: 100\r\n"
+        "\r\n"
+        "%x\r\n%s\r\n"
+        "0\r\n\r\n";
+
+    ret = snprintf(request, sizeof(request), request_template,
+                   (unsigned int) strlen(body), body);
+    if (ret <= 0 || (size_t) ret >= sizeof(request)) {
+        return;
+    }
+
+    clear_output_num();
+
+    cb_data.cb = cb_check_result_json;
+    cb_data.data = "\"test\":\"msg\"";
+
+    ctx = test_ctx_create(&cb_data);
+    if (!TEST_CHECK(ctx != NULL)) {
+        TEST_MSG("test_ctx_create failed");
+        exit(EXIT_FAILURE);
+    }
+
+    ret = flb_output_set(ctx->flb, ctx->o_ffd,
+                         "match", "*",
+                         "format", "json",
+                         NULL);
+    TEST_CHECK(ret == 0);
+
+    /* Start the engine */
+    ret = flb_start(ctx->flb);
+    TEST_CHECK(ret == 0);
+
+    num = get_output_num();
+
+    response_length = send_raw_http_request(request,
+                                            response,
+                                            sizeof(response));
+    if (!TEST_CHECK(response_length > 0)) {
+        TEST_MSG("no response for chunked + Content-Length request");
+    }
+    else {
+        TEST_CHECK(strstr(response, "HTTP/1.1 201") != NULL);
+    }
+
+    /* waiting to flush */
+    flb_time_msleep(1500);
+
+    if (!TEST_CHECK(get_output_num() > num)) {
+        TEST_MSG("chunked + Content-Length request was not processed");
+    }
+
+    flb_time_msleep(500);
+    test_ctx_destroy(ctx);
+}
+
 /* Test if remote_addr injection is skipped if remote_addr_key is already present */
 void flb_test_http_remote_addr_skip_colliding_ng(void)
 {
@@ -1311,6 +1387,7 @@ TEST_LIST = {
     {"tag_key_with_array_input", flb_test_http_tag_key_with_array_input},
     {"oauth2_requires_token", flb_test_http_oauth2_requires_token},
     {"oauth2_accepts_valid_token", flb_test_http_oauth2_accepts_valid_token},
+    {"chunked_with_content_length", flb_test_http_chunked_with_content_length},
     {"add_remote_addr_skip_colliding_ng", flb_test_http_remote_addr_skip_colliding_ng},
     {"add_remote_addr_map_ng", flb_test_http_remote_addr_map_ng},
     {"add_remote_addr_array_ng", flb_test_http_remote_addr_array_ng},
