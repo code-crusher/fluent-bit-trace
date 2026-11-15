@@ -1152,7 +1152,14 @@ int mk_http_parser(struct mk_http_request *req, struct mk_http_parser *p,
         }
         else if (p->level == REQ_LEVEL_END) {
             if (buffer[p->i] == '\n') {
-                if (p->header_content_length > 0) {
+                /*
+                 * Transfer-Encoding: chunked takes precedence over
+                 * Content-Length (RFC 9112, section 6.3): hand over the
+                 * request to mk_http_parser_ok() so the chunked body is
+                 * decoded instead of waiting for Content-Length bytes.
+                 */
+                if (p->header_content_length > 0 &&
+                    !mk_http_parser_is_content_chunked(p)) {
                     p->level = REQ_LEVEL_BODY;
                     p->chars = -1;
                     start_next();
@@ -1172,7 +1179,8 @@ int mk_http_parser(struct mk_http_request *req, struct mk_http_parser *p,
              * - A Pipeline Request
              * - A Body content (POST/PUT methods)
              */
-            if (p->header_content_length > 0) {
+            if (p->header_content_length > 0 &&
+                !mk_http_parser_is_content_chunked(p)) {
 
                 p->body_received = len - p->start;
                 if ((len - p->start) < p->header_content_length) {
