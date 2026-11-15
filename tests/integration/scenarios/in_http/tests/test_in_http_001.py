@@ -557,6 +557,33 @@ def test_in_http_rejects_empty_content_length(header_value, following_data):
     assert forwarded_payloads == []
 
 
+def test_in_http_chunked_takes_precedence_over_content_length():
+    service = Service("in_http_config")
+    body = b'{"message":"chunked-with-content-length"}'
+    request = (
+        b"POST / HTTP/1.1\r\n"
+        b"Host: localhost\r\n"
+        b"Content-Type: application/json\r\n"
+        b"Transfer-Encoding: chunked\r\n"
+        b"Content-Length: 100\r\n"
+        b"Connection: close\r\n"
+        b"\r\n"
+        + hex(len(body))[2:].encode() + b"\r\n" + body + b"\r\n"
+        + b"0\r\n\r\n"
+    )
+
+    try:
+        service.start()
+        response = send_raw_http1_request(service.flb_listener_port, request)
+        forwarded_payloads = service.read_forwarded_payloads()
+    finally:
+        service.stop()
+
+    assert b"HTTP/1.1 201" in response
+    assert len(forwarded_payloads) == 1
+    assert forwarded_payloads[0][0]["message"] == "chunked-with-content-length"
+
+
 @pytest.mark.parametrize(
     "case",
     [
