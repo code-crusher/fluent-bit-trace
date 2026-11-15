@@ -565,6 +565,94 @@ static int send_invalid_header_request(void)
     return strstr(response, "HTTP/1.1 4") != NULL ? 0 : -1;
 }
 
+/*
+ * Send a raw HTTP request and wait for the server to close the connection.
+ * Returns the number of bytes received before EOF, or -1 on error/timeout.
+ */
+static int send_raw_request_and_wait_close(const char *request,
+                                           char *response,
+                                           size_t response_size,
+                                           int timeout_seconds)
+{
+    struct sockaddr_in address;
+    struct timeval timeout;
+    fd_set read_fds;
+    flb_sockfd_t fd;
+    size_t request_length;
+    size_t request_offset;
+    int ret;
+    int written;
+    int received;
+    int response_length;
+
+    if (response_size < 2) {
+        return -1;
+    }
+
+    response[0] = '\0';
+    request_length = strlen(request);
+    fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd == FLB_INVALID_SOCKET) {
+        return -1;
+    }
+
+    memset(&address, 0, sizeof(address));
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    address.sin_port = htons(9880);
+
+    ret = connect(fd, (struct sockaddr *) &address, sizeof(address));
+    if (ret != 0) {
+        flb_socket_close(fd);
+        return -1;
+    }
+
+    request_offset = 0;
+    while (request_offset < request_length) {
+        written = send(fd,
+                       request + request_offset,
+                       (int) (request_length - request_offset),
+                       0);
+        if (written <= 0) {
+            flb_socket_close(fd);
+            return -1;
+        }
+        request_offset += (size_t) written;
+    }
+
+    response_length = 0;
+    while (response_length < (int) response_size - 1) {
+        FD_ZERO(&read_fds);
+        FD_SET(fd, &read_fds);
+        timeout.tv_sec = timeout_seconds;
+        timeout.tv_usec = 0;
+
+        ret = select((int) (fd + 1), &read_fds, NULL, NULL, &timeout);
+        if (ret <= 0) {
+            /* Timed out: the server did not close the connection */
+            flb_socket_close(fd);
+            return -1;
+        }
+
+        received = recv(fd,
+                        response + response_length,
+                        (int) response_size - 1 - response_length,
+                        0);
+        if (received <= 0) {
+            /* EOF: the server closed the connection */
+            break;
+        }
+
+        response_length += received;
+        response[response_length] = '\0';
+    }
+
+    flb_socket_close(fd);
+    response[response_length] = '\0';
+
+    return response_length;
+}
+
 void flb_test_http(void)
 {
     struct flb_lib_out_cb cb_data;
@@ -1273,6 +1361,258 @@ void test_http_add_remote_addr(char *input, char *xff_content, char *expected_ip
     test_ctx_destroy(ctx);
 }
 
+/*
+ * A request carrying 'Connection: close' must be answered with a response
+ * that advertises 'Connection: close' and the server must close the socket
+ * promptly instead of idling until the I/O timeout (issue #12655).
+ */
+void flb_test_http_connection_close_header(void)
+{
+    struct flb_lib_out_cb cb_data;
+    struct test_ctx *ctx;
+    const char *body = "{\"test\":\"msg\"}";
+    const char *request_template =
+        "POST / HTTP/1.1\r\n"
+        "Host: 127.0.0.1\r\n"
+        "Content-Length: %zu\r\n"
+        "Content-Type: application/json\r\n"
+        "Connection: close\r\n"
+        "\r\n"
+        "%s";
+    char request[512];
+    char response[512];
+    int ret;
+    int response_length;
+
+    clear_output_num();
+
+    cb_data.cb = cb_check_result_json;
+    cb_data.data = "\"test\":\"msg\"";
+
+    ctx = test_ctx_create(&cb_data);
+    if (!TEST_CHECK(ctx != NULL)) {
+        TEST_MSG("test_ctx_create failed");
+        exit(EXIT_FAILURE);
+    }
+
+    ret = flb_output_set(ctx->flb, ctx->o_ffd,
+                         "match", "*",
+                         "format", "json",
+                         NULL);
+    TEST_CHECK(ret == 0);
+
+    /* Start the engine */
+    ret = flb_start(ctx->flb);
+    TEST_CHECK(ret == 0);
+
+    ret = snprintf(request, sizeof(request), request_template,
+                   strlen(body), body);
+    if (!TEST_CHECK(ret > 0 && (size_t) ret < sizeof(request))) {
+        test_ctx_destroy(ctx);
+        return;
+    }
+
+    /*
+     * The server must close the connection right after the response; the
+     * default idle timeout is 10 seconds, so anything longer than 5 means
+     * the close never happened and we hit the timeout instead.
+     */
+    response_length = send_raw_request_and_wait_close(request, response,
+                                                      sizeof(response), 5);
+    if (!TEST_CHECK(response_length > 0)) {
+        TEST_MSG("no response or connection was not closed promptly");
+        test_ctx_destroy(ctx);
+        return;
+    }
+
+    if (!TEST_CHECK(strstr(response, "HTTP/1.1 201") != NULL)) {
+        TEST_MSG("unexpected response: %s", response);
+    }
+
+    if (!TEST_CHECK(strstr(response, "connection: close") != NULL)) {
+        TEST_MSG("response does not advertise 'Connection: close': %s", response);
+    }
+
+    /* waiting to flush */
+    flb_time_msleep(1500);
+
+    if (!TEST_CHECK(get_output_num() > 0)) {
+        TEST_MSG("no outputs");
+    }
+
+    test_ctx_destroy(ctx);
+}
+
+/*
+ * Without a 'Connection: close' request header the HTTP/1.1 connection must
+ * stay open (keep-alive is the default), ensuring the fix did not make the
+ * server close every connection.
+ */
+void flb_test_http_connection_keepalive_default(void)
+{
+    struct flb_lib_out_cb cb_data;
+    struct test_ctx *ctx;
+    const char *body = "{\"test\":\"msg\"}";
+    const char *request_template =
+        "POST / HTTP/1.1\r\n"
+        "Host: 127.0.0.1\r\n"
+        "Content-Length: %zu\r\n"
+        "Content-Type: application/json\r\n"
+        "\r\n"
+        "%s";
+    char request[512];
+    char response[512];
+    struct sockaddr_in address;
+    struct timeval timeout;
+    fd_set read_fds;
+    flb_sockfd_t fd;
+    size_t request_length;
+    size_t request_offset;
+    int ret;
+    int written;
+    int received;
+    int response_length;
+    int closed;
+
+    clear_output_num();
+
+    cb_data.cb = cb_check_result_json;
+    cb_data.data = "\"test\":\"msg\"";
+
+    ctx = test_ctx_create(&cb_data);
+    if (!TEST_CHECK(ctx != NULL)) {
+        TEST_MSG("test_ctx_create failed");
+        exit(EXIT_FAILURE);
+    }
+
+    ret = flb_output_set(ctx->flb, ctx->o_ffd,
+                         "match", "*",
+                         "format", "json",
+                         NULL);
+    TEST_CHECK(ret == 0);
+
+    /* Start the engine */
+    ret = flb_start(ctx->flb);
+    TEST_CHECK(ret == 0);
+
+    ret = snprintf(request, sizeof(request), request_template,
+                   strlen(body), body);
+    if (!TEST_CHECK(ret > 0 && (size_t) ret < sizeof(request))) {
+        test_ctx_destroy(ctx);
+        return;
+    }
+
+    /* Send the request on a raw socket we keep open after the response */
+    request_length = strlen(request);
+    fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (!TEST_CHECK(fd != FLB_INVALID_SOCKET)) {
+        TEST_MSG("socket creation failed");
+        test_ctx_destroy(ctx);
+        return;
+    }
+
+    memset(&address, 0, sizeof(address));
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    address.sin_port = htons(9880);
+
+    ret = connect(fd, (struct sockaddr *) &address, sizeof(address));
+    if (!TEST_CHECK(ret == 0)) {
+        TEST_MSG("connect failed");
+        flb_socket_close(fd);
+        test_ctx_destroy(ctx);
+        return;
+    }
+
+    request_offset = 0;
+    while (request_offset < request_length) {
+        written = send(fd,
+                       request + request_offset,
+                       (int) (request_length - request_offset),
+                       0);
+        if (!TEST_CHECK(written > 0)) {
+            TEST_MSG("send failed");
+            flb_socket_close(fd);
+            test_ctx_destroy(ctx);
+            return;
+        }
+        request_offset += (size_t) written;
+    }
+
+    /* Read the response */
+    response_length = 0;
+    closed = 0;
+    while (response_length < (int) sizeof(response) - 1) {
+        FD_ZERO(&read_fds);
+        FD_SET(fd, &read_fds);
+        timeout.tv_sec = 5;
+        timeout.tv_usec = 0;
+
+        ret = select((int) (fd + 1), &read_fds, NULL, NULL, &timeout);
+        if (!TEST_CHECK(ret > 0)) {
+            TEST_MSG("timeout waiting for response");
+            flb_socket_close(fd);
+            test_ctx_destroy(ctx);
+            return;
+        }
+
+        received = recv(fd,
+                        response + response_length,
+                        (int) sizeof(response) - 1 - response_length,
+                        0);
+        if (received <= 0) {
+            closed = 1;
+            break;
+        }
+
+        response_length += received;
+        response[response_length] = '\0';
+
+        if (strstr(response, "\r\n\r\n") != NULL) {
+            break;
+        }
+    }
+
+    if (!TEST_CHECK(response_length > 0)) {
+        TEST_MSG("no response");
+        flb_socket_close(fd);
+        test_ctx_destroy(ctx);
+        return;
+    }
+
+    if (!TEST_CHECK(strstr(response, "HTTP/1.1 201") != NULL)) {
+        TEST_MSG("unexpected response: %s", response);
+    }
+
+    if (!TEST_CHECK(closed == 0)) {
+        TEST_MSG("server closed a keep-alive HTTP/1.1 connection");
+    }
+
+    /* The socket must still be readable-pending EOF free: select must time out */
+    if (closed == 0) {
+        FD_ZERO(&read_fds);
+        FD_SET(fd, &read_fds);
+        timeout.tv_sec = 1;
+        timeout.tv_usec = 0;
+
+        ret = select((int) (fd + 1), &read_fds, NULL, NULL, &timeout);
+        if (!TEST_CHECK(ret == 0)) {
+            TEST_MSG("keep-alive connection was not kept open");
+        }
+    }
+
+    flb_socket_close(fd);
+
+    /* waiting to flush */
+    flb_time_msleep(1500);
+
+    if (!TEST_CHECK(get_output_num() > 0)) {
+        TEST_MSG("no outputs");
+    }
+
+    test_ctx_destroy(ctx);
+}
+
 /* Test if remote_addr injection is skipped if remote_addr_key is already present */
 void flb_test_http_remote_addr_skip_colliding_ng(void)
 {
@@ -1303,6 +1643,8 @@ void flb_test_http_remote_addr_array(void)
 
 TEST_LIST = {
     {"http", flb_test_http},
+    {"connection_close_header", flb_test_http_connection_close_header},
+    {"connection_keepalive_default", flb_test_http_connection_keepalive_default},
     {"successful_response_code_200", flb_test_http_successful_response_code_200},
     {"successful_response_code_204", flb_test_http_successful_response_code_204},
     {"failure_response_code_400_bad_json", flb_test_http_failure_400_bad_json},
