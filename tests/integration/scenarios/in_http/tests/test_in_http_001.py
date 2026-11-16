@@ -315,6 +315,131 @@ def test_in_http_rejects_get_requests():
     assert result["status_code"] >= 400
 
 
+def send_expect_continue_request(port, body=b'{"message":"expect-continue"}'):
+    """Send headers with Expect: 100-continue, wait for the interim response,
+    then send the body. Returns (interim_response, final_response)."""
+    request_head = (
+        b"POST / HTTP/1.1\r\n"
+        b"Host: localhost\r\n"
+        b"Content-Type: application/json\r\n"
+        b"Expect: 100-continue\r\n"
+        + f"Content-Length: {len(body)}\r\n".encode()
+        + b"Connection: close\r\n"
+        b"\r\n"
+    )
+
+    interim = bytearray()
+
+    with socket.create_connection(("127.0.0.1", port), timeout=5) as connection:
+        connection.settimeout(5)
+        connection.sendall(request_head)
+
+        try:
+            while b"\r\n\r\n" not in interim:
+                data = connection.recv(4096)
+
+                if not data:
+                    break
+                interim.extend(data)
+                if len(interim) > 4096:
+                    break
+        except socket.timeout:
+            pass
+
+        assert b"HTTP/1.1 100 Continue" in bytes(interim)
+
+        connection.sendall(body)
+
+        final = bytearray()
+        while True:
+            try:
+                data = connection.recv(4096)
+            except socket.timeout:
+                break
+
+            if not data:
+                break
+            final.extend(data)
+            if b"\r\n\r\n" in final:
+                break
+
+    return bytes(interim), bytes(final)
+
+
+def test_in_http_sends_100_continue_for_expect_header():
+    service = Service("in_http_config")
+
+    try:
+        service.start()
+        interim, final = send_expect_continue_request(service.flb_listener_port)
+        forwarded_payloads = service.read_forwarded_payloads()
+    finally:
+        service.stop()
+
+    assert interim.startswith(b"HTTP/1.1 100 Continue")
+    assert b"HTTP/1.1 201" in final
+    assert len(forwarded_payloads) == 1
+    assert forwarded_payloads[0][0]["message"] == "expect-continue"
+
+
+def test_in_http_accepts_expect_continue_case_insensitively():
+    service = Service("in_http_config")
+    body = b'{"message":"expect-case"}'
+    request_head = (
+        b"POST / HTTP/1.1\r\n"
+        b"Host: localhost\r\n"
+        b"Content-Type: application/json\r\n"
+        b"Expect:   100-CONTINUE \r\n"
+        + f"Content-Length: {len(body)}\r\n".encode()
+        + b"Connection: close\r\n"
+        b"\r\n"
+    )
+    interim = bytearray()
+
+    try:
+        service.start()
+        with socket.create_connection(("127.0.0.1", service.flb_listener_port), timeout=5) as connection:
+            connection.settimeout(5)
+            connection.sendall(request_head)
+
+            while b"\r\n\r\n" not in interim:
+                try:
+                    data = connection.recv(4096)
+                except socket.timeout:
+                    break
+
+                if not data:
+                    break
+                interim.extend(data)
+                if len(interim) > 4096:
+                    break
+
+            assert b"HTTP/1.1 100 Continue" in bytes(interim)
+
+            connection.sendall(body)
+
+            final = bytearray()
+            while True:
+                try:
+                    data = connection.recv(4096)
+                except socket.timeout:
+                    break
+
+                if not data:
+                    break
+                final.extend(data)
+                if b"\r\n\r\n" in final:
+                    break
+
+        forwarded_payloads = service.read_forwarded_payloads()
+    finally:
+        service.stop()
+
+    assert b"HTTP/1.1 201" in final
+    assert len(forwarded_payloads) == 1
+    assert forwarded_payloads[0][0]["message"] == "expect-case"
+
+
 def test_in_http_accepts_post_with_empty_generic_headers():
     service = Service("in_http_config")
     body = b'{"message":"empty-header"}'
