@@ -670,8 +670,23 @@ static int process_pack_ng(struct flb_http *ctx, flb_sds_t tag, char *buf,
             for (i = 0; i < obj->via.array.size; i++)
             {
                 record = obj->via.array.ptr[i];
-                if (record.type == MSGPACK_OBJECT_MAP &&
-                    remote_addr != NULL && flb_sds_len(remote_addr) > 0) {
+                if (record.type != MSGPACK_OBJECT_MAP) {
+                    flb_plg_error(ctx->ins, "skip record from invalid type: %i",
+                                  record.type);
+
+                    msgpack_unpacked_destroy(&result);
+                    if (appended_initialized) {
+                        msgpack_unpacked_destroy(&appended_result);
+                        msgpack_sbuffer_destroy(&appended_sbuf);
+                    }
+                    if (remote_addr != NULL) {
+                        flb_sds_destroy(remote_addr);
+                    }
+
+                    return -1;
+                }
+
+                if (remote_addr != NULL && flb_sds_len(remote_addr) > 0) {
                     if (!appended_initialized) {
                         /* doing this only once, since it can be cleared and reused */
                         msgpack_sbuffer_init(&appended_sbuf);
