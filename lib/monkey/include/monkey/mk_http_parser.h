@@ -400,6 +400,15 @@ static inline size_t mk_http_parser_request_size(struct mk_http_parser *p, char 
      * size of the request
      */
     if (mk_http_parser_is_content_chunked(p)) {
+        if (p->chunk_processed_start == NULL) {
+            /* chunked body starts right after the header block */
+            if (p->i <= 0 || (size_t) p->i > buf_request_len) {
+                return -1;
+            }
+
+            return (size_t) p->i;
+        }
+
         if (p->chunk_processed_start < buf_request) {
             return -1;
         }
@@ -411,12 +420,24 @@ static inline size_t mk_http_parser_request_size(struct mk_http_parser *p, char 
         }
         return bytes;
     }
-    else if (p->header_content_length > 0) {
+    else if (p->header_content_length >= 0) {
         /* p->i points to the last byte after the content body */
+        if (p->i < 0 || (size_t) p->i > buf_request_len) {
+            return -1;
+        }
+
         return p->i;
     }
 
-    return -1;
+    /*
+     * no body: p->i points to the last byte of the header block, which
+     * may sit on the final line feed when the input ends with CRLF.
+     */
+    if (p->i < 0 || (size_t) p->i >= buf_request_len) {
+        return -1;
+    }
+
+    return (size_t) p->i + 1;
 }
 
 #endif /* MK_HTTP_H */

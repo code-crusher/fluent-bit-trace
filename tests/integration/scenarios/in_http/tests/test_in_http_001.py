@@ -167,6 +167,47 @@ def send_raw_http1_request(port, request, split_at=None):
     return bytes(response)
 
 
+def read_response_headers(connection, response):
+    connection.settimeout(5)
+
+    while b"\r\n\r\n" not in response:
+        data = connection.recv(4096)
+        if not data:
+            pytest.fail(f"connection closed before response headers were received: {bytes(response)!r}")
+        response.extend(data)
+
+    header_blob, _, remainder = bytes(response).partition(b"\r\n\r\n")
+    headers = {}
+    for line in header_blob.split(b"\r\n")[1:]:
+        name, separator, value = line.partition(b":")
+        assert separator, f"malformed header line: {line!r}"
+        headers[name.decode().strip().lower()] = value.decode().strip()
+
+    return headers, remainder
+
+
+def read_response_body(connection, response, remainder, content_length):
+    body = remainder
+
+    while len(body) < content_length:
+        chunk = connection.recv(content_length - len(body))
+        if not chunk:
+            break
+        body += chunk
+
+    return body
+
+
+def read_full_response(connection, initial=b""):
+    response = bytearray(initial)
+    headers, remainder = read_response_headers(connection, response)
+    content_length = int(headers.get("content-length", "0"))
+    body = read_response_body(connection, response, remainder, content_length)
+    status_line = bytes(response).split(b"\r\n", 1)[0]
+
+    return status_line, headers, body[:content_length], body[content_length:]
+
+
 def send_split_http2_preface(port):
     preface = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
     settings_frame = b"\x00\x00\x00\x04\x00\x00\x00\x00\x00"
@@ -281,6 +322,105 @@ def test_in_http_accepts_http1_request_split_before_autodetect_boundary():
     assert b"HTTP/1.1 201" in response
     assert len(forwarded_payloads) == 1
     assert forwarded_payloads[0][0]["message"] == "split-http1"
+
+
+def test_in_http_content_length_limits_json_body():
+    service = Service("in_http_config")
+    service.start()
+
+    body = b'{"message":"bounded"}'
+    request = (
+        b"POST / HTTP/1.1\r\n"
+        b"Host: localhost\r\n"
+        b"Content-Type: application/json\r\n"
+        b"Content-Length: " + str(len(body)).encode() + b"\r\n"
+        b"\r\n" + body + b"ZZZ"
+    )
+
+    try:
+        connection = socket.create_connection(("127.0.0.1", service.flb_listener_port), timeout=5)
+        connection.sendall(request)
+        status_line, _, _, _ = read_full_response(connection)
+        connection.close()
+        forwarded_payloads = service.read_forwarded_payloads()
+    finally:
+        service.stop()
+
+    assert b" 201" in status_line
+    assert len(forwarded_payloads) == 1
+    assert forwarded_payloads[0][0]["message"] == "bounded"
+
+
+def test_in_http_content_length_limits_form_body():
+    service = Service("in_http_config")
+    service.start()
+
+    body = b"message=bounded"
+    request = (
+        b"POST / HTTP/1.1\r\n"
+        b"Host: localhost\r\n"
+        b"Content-Type: application/x-www-form-urlencoded\r\n"
+        b"Content-Length: " + str(len(body)).encode() + b"\r\n"
+        b"\r\n" + body + b"&extra=unparsed"
+    )
+
+    try:
+        connection = socket.create_connection(("127.0.0.1", service.flb_listener_port), timeout=5)
+        connection.sendall(request)
+        status_line, _, _, _ = read_full_response(connection)
+        connection.close()
+        forwarded_payloads = service.read_forwarded_payloads()
+    finally:
+        service.stop()
+
+    assert b" 201" in status_line
+    assert len(forwarded_payloads) == 1
+    assert forwarded_payloads[0][0]["message"] == "bounded"
+    assert "extra" not in forwarded_payloads[0][0]
+
+
+def test_in_http_pipelined_requests_are_not_corrupted():
+    service = Service("in_http_config")
+    service.start()
+
+    first_body = b'{"message":"first"}'
+    second_body = b'{"message":"second"}'
+    first = (
+        b"POST / HTTP/1.1\r\n"
+        b"Host: localhost\r\n"
+        b"Content-Type: application/json\r\n"
+        b"Content-Length: " + str(len(first_body)).encode() + b"\r\n"
+        b"\r\n" + first_body
+    )
+    second = (
+        b"POST / HTTP/1.1\r\n"
+        b"Host: localhost\r\n"
+        b"Content-Type: application/json\r\n"
+        b"Content-Length: " + str(len(second_body)).encode() + b"\r\n"
+        b"\r\n" + second_body
+    )
+
+    try:
+        connection = socket.create_connection(("127.0.0.1", service.flb_listener_port), timeout=5)
+        connection.sendall(first + second)
+        first_status, _, _, leftover = read_full_response(connection)
+        second_status, _, _, _ = read_full_response(connection, leftover)
+        connection.close()
+        forwarded_payloads = service.service.wait_for_condition(
+            lambda: list(data_storage["payloads"])
+            if sum(len(payload) for payload in data_storage["payloads"]) == 2
+            else None,
+            timeout=10,
+            interval=0.1,
+            description="two forwarded HTTP records",
+        )
+    finally:
+        service.stop()
+
+    assert b" 201" in first_status
+    assert b" 201" in second_status
+    messages = [record["message"] for payload in forwarded_payloads for record in payload]
+    assert messages == ["first", "second"]
 
 
 def test_in_http_rejects_bad_json():

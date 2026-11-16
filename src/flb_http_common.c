@@ -1538,6 +1538,8 @@ int flb_http_stream_init(struct flb_http_stream *stream,
     stream->incoming_header_size = 0;
     stream->incoming_header_count = 0;
 
+    cfl_list_entry_init(&stream->_head);
+
     if (role == HTTP_STREAM_ROLE_SERVER) {
         stream->status = HTTP_STREAM_STATUS_RECEIVING_HEADERS;
     }

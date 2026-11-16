@@ -1174,12 +1174,12 @@ int mk_http_parser(struct mk_http_request *req, struct mk_http_parser *p,
              */
             if (p->header_content_length > 0) {
 
-                p->body_received = len - p->start;
                 if ((len - p->start) < p->header_content_length) {
                     return MK_HTTP_PARSER_PENDING;
                 }
 
-                /* Cut off */
+                /* Cut off: only the declared Content-Length bytes belong to this body */
+                p->body_received = p->header_content_length;
                 p->i += p->body_received;
                 req->data.len  = p->body_received;
                 req->data.data = (buffer + p->start);

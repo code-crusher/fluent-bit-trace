@@ -413,27 +413,26 @@ static void test_ctx_destroy(struct test_ctx *ctx)
     flb_free(ctx);
 }
 
-static int send_raw_http_request(const char *request,
-                                 char *response,
-                                 size_t response_size)
+static int send_raw_http_request_timeout(const char *request, size_t request_len,
+                                          char *response,
+                                          size_t response_size,
+                                          int timeout_seconds)
 {
     struct sockaddr_in address;
     struct timeval timeout;
     fd_set read_fds;
     flb_sockfd_t fd;
-    size_t request_length;
     size_t request_offset;
     int ret;
     int written;
     int received;
     int response_length;
 
-    if (response_size < 2) {
+    if (response_size < 2 || request_len == 0) {
         return -1;
     }
 
     response[0] = '\0';
-    request_length = strlen(request);
     fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd == FLB_INVALID_SOCKET) {
         return -1;
@@ -451,10 +450,10 @@ static int send_raw_http_request(const char *request,
     }
 
     request_offset = 0;
-    while (request_offset < request_length) {
+    while (request_offset < request_len) {
         written = send(fd,
                        request + request_offset,
-                       (int) (request_length - request_offset),
+                       (int) (request_len - request_offset),
                        0);
         if (written <= 0) {
             flb_socket_close(fd);
@@ -467,13 +466,12 @@ static int send_raw_http_request(const char *request,
     while (response_length < (int) response_size - 1) {
         FD_ZERO(&read_fds);
         FD_SET(fd, &read_fds);
-        timeout.tv_sec = 2;
+        timeout.tv_sec = timeout_seconds;
         timeout.tv_usec = 0;
 
         ret = select((int) (fd + 1), &read_fds, NULL, NULL, &timeout);
         if (ret <= 0) {
-            flb_socket_close(fd);
-            return -1;
+            break;
         }
 
         received = recv(fd,
@@ -486,13 +484,40 @@ static int send_raw_http_request(const char *request,
 
         response_length += received;
         response[response_length] = '\0';
-        if (strstr(response, "\r\n") != NULL) {
+
+        /* Give the peer a moment to flush any additional pipelined responses. */
+        timeout.tv_sec = 0;
+        timeout.tv_usec = 100000;
+        FD_ZERO(&read_fds);
+        FD_SET(fd, &read_fds);
+        ret = select((int) (fd + 1), &read_fds, NULL, NULL, &timeout);
+        if (ret <= 0) {
             break;
         }
     }
 
     flb_socket_close(fd);
     response[response_length] = '\0';
+
+    return response_length;
+}
+
+static int send_raw_http_request(const char *request,
+                                 char *response,
+                                 size_t response_size)
+{
+    int response_length;
+    size_t request_length;
+
+    request_length = strlen(request);
+    response_length = send_raw_http_request_timeout(request,
+                                                    request_length,
+                                                    response,
+                                                    response_size,
+                                                    2);
+    if (response_length < 0) {
+        return -1;
+    }
 
     if (response_length > 0 && strstr(response, "\r\n") == NULL) {
         return -1;

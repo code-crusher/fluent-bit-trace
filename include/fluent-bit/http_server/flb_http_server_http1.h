@@ -37,8 +37,18 @@ struct flb_http1_server_session {
     size_t                          request_line_version_offset;
     int                             request_line_state;
     int                             headers_complete;
-    struct flb_http_stream          stream;
+
+    /*
+     * Streams created for parsed requests, awaiting dispatch. Each stream is
+     * heap-allocated and shared with the request queue until the request is
+     * dispatched and released.
+     */
+    struct cfl_list                 streams;
     struct flb_http_server_session *parent;
+
+    /* Set when the parser rejects trailing bytes or a request fails hard;
+     * any queued responses are flushed before the connection is closed. */
+    int                             close_after_response;
 };
 
 /* RESPONSE */
@@ -66,8 +76,11 @@ int flb_http1_server_session_init(struct flb_http1_server_session *session,
 
 void flb_http1_server_session_destroy(struct flb_http1_server_session *session);
 
-int flb_http1_server_session_ingest(struct flb_http1_server_session *session, 
-                         unsigned char *buffer, 
+int flb_http1_server_session_ingest(struct flb_http1_server_session *session,
+                         unsigned char *buffer,
                          size_t length);
+
+void flb_http1_server_session_release_stream(struct flb_http1_server_session *session,
+                                             struct flb_http_stream *stream);
 
 #endif

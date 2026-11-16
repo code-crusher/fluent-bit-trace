@@ -1089,7 +1089,7 @@ void test_http1_rejects_invalid_partial_request_line(void)
             }
             TEST_CHECK_(result == cases[index].expected, "request line: %s", cases[index].data);
             if (result == HTTP_SERVER_PROVIDER_ERROR) {
-                TEST_CHECK(session->http1.stream.status == HTTP_STREAM_STATUS_ERROR);
+                TEST_CHECK(cfl_list_is_empty(&session->request_queue));
             }
             flb_http_server_session_destroy(session);
         }
@@ -1147,13 +1147,23 @@ static void check_http1_fragmented_header_limit(size_t header_limit)
 
             if (over) {
                 TEST_CHECK(result == HTTP_SERVER_PROVIDER_ERROR);
-                TEST_CHECK(session->http1.stream.status == HTTP_STREAM_STATUS_ERROR);
+                TEST_CHECK(cfl_list_is_empty(&session->request_queue));
             }
             else {
+                struct cfl_list *it;
+                struct flb_http_stream *stream;
+                int found = 0;
+
                 TEST_CHECK(result == HTTP_SERVER_SUCCESS);
-                TEST_CHECK(session->http1.stream.status == HTTP_STREAM_STATUS_READY);
                 TEST_CHECK(session->http1.header_scan_offset == 0);
                 TEST_CHECK(session->http1.headers_complete == FLB_FALSE);
+                cfl_list_foreach(it, &session->http1.streams) {
+                    stream = cfl_list_entry(it, struct flb_http_stream, _head);
+                    if (stream->status == HTTP_STREAM_STATUS_READY) {
+                        found = 1;
+                    }
+                }
+                TEST_CHECK(found);
             }
             flb_http_server_session_destroy(session);
         }

@@ -490,7 +490,7 @@ static int flb_http_server_inflate_request(struct flb_http_request *request,
 
 static int flb_http_server_client_activity_event_handler(void *data)
 {
-    int                             close_connection;
+    int                             close_connection = FLB_FALSE;
     struct cfl_list                *backup_iterator;
     struct flb_connection          *connection;
     struct cfl_list                *iterator;
@@ -536,14 +536,30 @@ static int flb_http_server_client_activity_event_handler(void *data)
         result = flb_http_server_session_read(session);
 
         if (result != 0) {
+            /*
+             * The read path failed. Any request that was parsed before the
+             * failure has already been queued, so flush its response before
+             * tearing the session down instead of dropping it silently.
+             */
+            if (!cfl_list_is_empty(&session->request_queue) ||
+                cfl_sds_len(session->outgoing_data) > 0) {
+                close_connection = FLB_TRUE;
+
+                goto dispatch;
+            }
+
             flb_http_server_session_destroy(session);
 
             return -1;
         }
     }
 
-    close_connection = FLB_FALSE;
+dispatch:
 
+    /*
+     * Pipelined HTTP/1.x requests are parsed up front. Any of them may opt
+     * into a connection close, so keep the sticky result across the batch.
+     */
     cfl_list_foreach_safe(iterator,
                             backup_iterator,
                             &session->request_queue) {
@@ -590,15 +606,16 @@ static int flb_http_server_client_activity_event_handler(void *data)
         }
 
 request_complete:
-        close_connection = flb_http_server_should_connection_be_closed(request);
+        if (flb_http_server_should_connection_be_closed(request)) {
+            close_connection = FLB_TRUE;
+        }
 
         if (session->version == HTTP_PROTOCOL_VERSION_20) {
             /* nghttp2 might still need the response (deferred DATA) */
             flb_http2_server_stream_release(stream);
         }
         else {
-            flb_http_request_destroy(&stream->request);
-            flb_http_response_destroy(&stream->response);
+            flb_http1_server_session_release_stream(&session->http1, stream);
         }
     }
 
@@ -610,7 +627,10 @@ request_complete:
         return -4;
     }
 
-    if (close_connection) {
+    if (close_connection ||
+        (session->version != HTTP_PROTOCOL_VERSION_20 &&
+         session->http1.close_after_response == FLB_TRUE &&
+         cfl_sds_len(session->outgoing_data) == 0)) {
         flb_http_server_session_destroy(session);
     }
     else if (flb_http_server_session_is_idle(session)) {
@@ -654,10 +674,6 @@ static int flb_http_server_client_connection_initialize(
     if (server->handoff != NULL) {
         flb_http_server_counter_add(&server->handoff->connections, 1);
         session->balanced_connection = FLB_TRUE;
-    }
-
-    if (session->version <= HTTP_PROTOCOL_VERSION_11) {
-        session->http1.stream.user_data = server->user_data;
     }
 
     connection->user_data     = (void *) session;
