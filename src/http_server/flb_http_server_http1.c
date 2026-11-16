@@ -18,7 +18,10 @@
  */
 
 #include <fluent-bit/http_server/flb_http_server.h>
+#include <strings.h>
 #include <string.h>
+
+static const char HTTP_CONTINUE_RESPONSE[] = "HTTP/1.1 100 Continue\r\n\r\n";
 
 /* PRIVATE */
 
@@ -56,6 +59,162 @@ static void dummy_mk_http_request_init(struct mk_http_session *session,
     memset(request, 0, sizeof(struct mk_http_request));
 
     mk_http_request_init(session, request, session->server);
+}
+
+/*
+ * RFC 9110 Section 10.1.1: a server that receives an "Expect: 100-continue"
+ * header field is expected to send a 100 (Continue) interim response so the
+ * client can proceed with the request body, or respond with a final status.
+ * Without the interim response, a client that honors the expectation stalls
+ * until its own timeout expires.
+ *
+ * Scan the raw header block for an "Expect" header instead of relying on the
+ * parser output: Monkey stores unrecognized headers as unnamed extra entries
+ * that are not reachable as a typed header at this layer.
+ */
+static int http1_request_expects_continue(const char *data, size_t length)
+{
+    size_t i;
+    size_t line_start;
+    size_t line_end;
+    size_t colon;
+    size_t name_start;
+    size_t name_end;
+    size_t value_start;
+    size_t value_end;
+    size_t token_start;
+    size_t token_end;
+    size_t start;
+
+    /* Skip the request line; the header section starts after the first CRLF. */
+    i = 0;
+    while (i + 1 < length) {
+        if (data[i] == '\r' && data[i + 1] == '\n') {
+            break;
+        }
+        i++;
+    }
+
+    if (i + 1 >= length) {
+        return 0;
+    }
+
+    line_start = i + 2;
+
+    while (line_start < length) {
+        line_end = line_start;
+        while (line_end < length &&
+               !(data[line_end] == '\r' && line_end + 1 < length &&
+                 data[line_end + 1] == '\n')) {
+            line_end++;
+        }
+
+        if (line_end >= length) {
+            return 0;
+        }
+
+        if (line_end == line_start) {
+            /* End of the header section. */
+            return 0;
+        }
+
+        colon = line_start;
+        while (colon < line_end && data[colon] != ':') {
+            colon++;
+        }
+
+        if (colon == line_end) {
+            line_start = line_end + 2;
+            continue;
+        }
+
+        name_start = line_start;
+        name_end = colon;
+        while (name_end > name_start &&
+               (data[name_end - 1] == ' ' || data[name_end - 1] == '\t')) {
+            name_end--;
+        }
+
+        if (name_end - name_start == sizeof("expect") - 1 &&
+            strncasecmp(data + name_start, "expect",
+                        sizeof("expect") - 1) == 0) {
+            value_start = colon + 1;
+            while (value_start < line_end &&
+                   (data[value_start] == ' ' || data[value_start] == '\t')) {
+                value_start++;
+            }
+            value_end = line_end;
+            while (value_end > value_start &&
+                   (data[value_end - 1] == ' ' || data[value_end - 1] == '\t')) {
+                value_end--;
+            }
+
+            /* The value may carry a comma-separated list of expectations. */
+            token_start = value_start;
+            while (token_start < value_end) {
+                size_t token_stop;
+
+                token_stop = token_start;
+                while (token_stop < value_end && data[token_stop] != ',') {
+                    token_stop++;
+                }
+
+                token_end = token_stop;
+                while (token_end > token_start &&
+                       (data[token_end - 1] == ' ' || data[token_end - 1] == '\t')) {
+                    token_end--;
+                }
+
+                start = token_start;
+                while (start < token_end &&
+                       (data[start] == ' ' || data[start] == '\t')) {
+                    start++;
+                }
+
+                if (token_end - start == sizeof("100-continue") - 1 &&
+                    strncasecmp(data + start, "100-continue",
+                                sizeof("100-continue") - 1) == 0) {
+                    return 1;
+                }
+
+                if (token_stop >= value_end) {
+                    break;
+                }
+                token_start = token_stop + 1;
+            }
+        }
+
+        line_start = line_end + 2;
+    }
+
+    return 0;
+}
+
+static int http1_send_continue(struct flb_http1_server_session *session)
+{
+    cfl_sds_t sds_result;
+
+    if (session->continue_sent) {
+        return 0;
+    }
+
+    session->continue_sent = FLB_TRUE;
+
+    if (session->parent->version < HTTP_PROTOCOL_VERSION_11) {
+        /* 1xx interim responses are not defined for HTTP/1.0 clients. */
+        return 0;
+    }
+
+    sds_result = cfl_sds_cat(session->parent->outgoing_data,
+                             HTTP_CONTINUE_RESPONSE,
+                             sizeof(HTTP_CONTINUE_RESPONSE) - 1);
+    if (sds_result == NULL) {
+        return -1;
+    }
+
+    session->parent->outgoing_data = sds_result;
+
+    return 0;
 }
 
 static int http1_evict_request(struct flb_http1_server_session *session)
@@ -511,6 +670,7 @@ int flb_http1_server_session_init(struct flb_http1_server_session *session,
     session->request_line_version_offset = 0;
     session->request_line_state = MK_ST_REQ_METHOD;
     session->headers_complete = FLB_FALSE;
+    session->continue_sent = FLB_FALSE;
 
     dummy_mk_http_session_init(&session->inner_session, &session->inner_server);
 
@@ -552,6 +712,7 @@ int flb_http1_server_session_ingest(struct flb_http1_server_session *session,
 {
     int result;
     size_t available;
+    size_t header_length;
     size_t header_limit;
     size_t offset;
     const char *data;
@@ -620,6 +781,21 @@ int flb_http1_server_session_ingest(struct flb_http1_server_session *session,
 
             return HTTP_SERVER_SUCCESS;
         }
+
+        if (!session->continue_sent) {
+            header_length = session->header_scan_offset;
+
+            if (header_length > cfl_sds_len(session->parent->incoming_data)) {
+                header_length = cfl_sds_len(session->parent->incoming_data);
+            }
+
+            if (http1_request_expects_continue(session->parent->incoming_data,
+                                               header_length) &&
+                http1_send_continue(session) != 0) {
+                session->stream.status = HTTP_STREAM_STATUS_ERROR;
+                return HTTP_SERVER_ALLOCATION_ERROR;
+            }
+        }
     }
 
     result = mk_http_parser(&session->inner_request,
@@ -642,6 +818,7 @@ int flb_http1_server_session_ingest(struct flb_http1_server_session *session,
         session->request_line_version_offset = 0;
         session->request_line_state = MK_ST_REQ_METHOD;
         session->headers_complete = FLB_FALSE;
+        session->continue_sent = FLB_FALSE;
     }
     else if (result == MK_HTTP_PARSER_PENDING) {
         /*
