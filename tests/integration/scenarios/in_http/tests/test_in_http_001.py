@@ -283,6 +283,59 @@ def test_in_http_accepts_http1_request_split_before_autodetect_boundary():
     assert forwarded_payloads[0][0]["message"] == "split-http1"
 
 
+def test_in_http_urlencoded_body_ignores_pipelined_bytes():
+    # Regression test for issue #12650: the urlencoded parser must honor
+    # Content-Length and must not absorb a pipelined request into the
+    # last form field's value.
+    first_body = b"a=1"
+    second_body = b"b=2"
+    request = (
+        b"POST /one HTTP/1.1\r\n"
+        b"Host: localhost\r\n"
+        b"Content-Type: application/x-www-form-urlencoded\r\n"
+        + f"Content-Length: {len(first_body)}\r\n".encode()
+        + b"\r\n"
+        + first_body
+        + b"POST /two HTTP/1.1\r\n"
+        b"Host: localhost\r\n"
+        b"Content-Type: application/x-www-form-urlencoded\r\n"
+        + f"Content-Length: {len(second_body)}\r\n".encode()
+        + b"\r\n"
+        + second_body
+    )
+
+    try:
+        service = Service("in_http_config")
+        service.start()
+        with socket.create_connection(("127.0.0.1", service.flb_listener_port), timeout=5) as connection:
+            connection.settimeout(5)
+            connection.sendall(request)
+            response = bytearray()
+            while response.count(b"HTTP/1.1") < 2 and len(response) < 8192:
+                try:
+                    data = connection.recv(4096)
+                except socket.timeout:
+                    break
+                if not data:
+                    break
+                response.extend(data)
+
+        forwarded_payloads = service.read_forwarded_payloads()
+    finally:
+        service.stop()
+
+    assert response.count(b"HTTP/1.1 201") == 2
+
+    # fluent-bit may batch both records into a single forwarded list
+    flattened = [
+        {key: value for key, value in item.items() if key != "date"}
+        for payload in forwarded_payloads
+        for item in (payload if isinstance(payload, list) else [payload])
+    ]
+    assert {"a": "1"} in flattened
+    assert {"b": "2"} in flattened
+
+
 def test_in_http_rejects_bad_json():
     service = Service("in_http_config")
     service.start()
