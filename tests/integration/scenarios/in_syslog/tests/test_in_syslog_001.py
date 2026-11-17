@@ -12,6 +12,10 @@ from utils.test_service import FluentBitTestService
 
 
 TCP_RFC5424_MESSAGE = b"<13>1 1970-01-01T00:00:00.000000+00:00 testhost testuser - - [] Hello!\n"
+TCP_RFC5424_EMPTY_MESSAGE = (
+    b'<13>1 2026-10-15T09:23:23.279036+00:00 en-0db1s4 root - - '
+    b'[timeQuality tzKnown="1" isSynced="0"] \n'
+)
 UDS_RFC3164_MESSAGE = b"<13>Jan  1 00:00:00 testuser:  Hello!\n"
 
 
@@ -94,6 +98,28 @@ def test_in_syslog_tcp_plaintext():
         service.stop()
 
     _assert_message(payloads)
+
+
+def test_in_syslog_tcp_empty_message():
+    service = Service("in_syslog_tcp_plaintext.yaml")
+    service.start()
+
+    try:
+        with socket.create_connection(("127.0.0.1", service.flb_listener_port), timeout=5) as sock:
+            sock.sendall(TCP_RFC5424_EMPTY_MESSAGE)
+            sock.shutdown(socket.SHUT_WR)
+
+        payloads = service.read_forwarded_payloads()
+    finally:
+        service.stop()
+
+    assert len(payloads) == 1
+    assert isinstance(payloads[0], list)
+    assert len(payloads[0]) == 1
+    record = payloads[0][0]
+    assert record["message"] == ""
+    assert record["host"] == "en-0db1s4"
+    assert record["ident"] == "root"
 
 
 def test_in_syslog_tcp_tls():
