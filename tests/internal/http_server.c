@@ -1089,7 +1089,7 @@ void test_http1_rejects_invalid_partial_request_line(void)
             }
             TEST_CHECK_(result == cases[index].expected, "request line: %s", cases[index].data);
             if (result == HTTP_SERVER_PROVIDER_ERROR) {
-                TEST_CHECK(session->http1.stream.status == HTTP_STREAM_STATUS_ERROR);
+                TEST_CHECK(cfl_list_is_empty(&session->http1.streams));
             }
             flb_http_server_session_destroy(session);
         }
@@ -1147,11 +1147,10 @@ static void check_http1_fragmented_header_limit(size_t header_limit)
 
             if (over) {
                 TEST_CHECK(result == HTTP_SERVER_PROVIDER_ERROR);
-                TEST_CHECK(session->http1.stream.status == HTTP_STREAM_STATUS_ERROR);
+                TEST_CHECK(cfl_list_is_empty(&session->http1.streams));
             }
             else {
                 TEST_CHECK(result == HTTP_SERVER_SUCCESS);
-                TEST_CHECK(session->http1.stream.status == HTTP_STREAM_STATUS_READY);
                 TEST_CHECK(session->http1.header_scan_offset == 0);
                 TEST_CHECK(session->http1.headers_complete == FLB_FALSE);
             }
@@ -1166,6 +1165,70 @@ void test_http1_fragmented_header_limit(void)
     check_http1_fragmented_header_limit(HTTP_SERVER_DEFAULT_HTTP1_MAX_HEADER_SIZE);
     check_http1_fragmented_header_limit(64 * 1024);
     check_http1_fragmented_header_limit(8 * 1024);
+}
+
+void test_http1_pipelined_body_is_clamped_to_content_length(void)
+{
+    struct flb_http_server server;
+    struct flb_http_server_session *session;
+    struct flb_http_request *request;
+    struct flb_http_stream *stream;
+    struct cfl_list *iterator;
+    int count;
+    char wire[] =
+        "POST /one HTTP/1.1\r\n"
+        "Host: localhost\r\n"
+        "Content-Type: application/x-www-form-urlencoded\r\n"
+        "Content-Length: 3\r\n"
+        "\r\n"
+        "a=1POST /two HTTP/1.1\r\n"
+        "Host: x\r\n"
+        "Content-Length: 3\r\n"
+        "\r\n"
+        "b=2";
+    size_t wire_len = sizeof(wire) - 1;
+    int result;
+
+    memset(&server, 0, sizeof(server));
+    server.buffer_max_size = HTTP_SERVER_MAXIMUM_BUFFER_SIZE;
+
+    session = flb_http_server_session_create(HTTP_PROTOCOL_VERSION_11);
+    TEST_ASSERT(session != NULL);
+    session->parent = &server;
+
+    result = flb_http_server_session_ingest(session,
+                                           (unsigned char *) wire,
+                                           wire_len);
+    TEST_CHECK(result == HTTP_SERVER_SUCCESS);
+    TEST_CHECK(!cfl_list_is_empty(&session->request_queue));
+
+    count = 0;
+    cfl_list_foreach(iterator, &session->request_queue) {
+        stream = cfl_list_entry(iterator, struct flb_http_stream, request._head);
+        request = &stream->request;
+
+        if (count == 0) {
+            TEST_CHECK(request->content_length == 3);
+            TEST_CHECK(request->body != NULL);
+            TEST_CHECK(cfl_sds_len(request->body) == 3);
+            TEST_CHECK(memcmp(request->body, "a=1", 3) == 0);
+            TEST_CHECK(request->path != NULL && strcmp(request->path, "/one") == 0);
+        }
+        else if (count == 1) {
+            TEST_CHECK(request->content_length == 3);
+            TEST_CHECK(request->body != NULL);
+            TEST_CHECK(cfl_sds_len(request->body) == 3);
+            TEST_CHECK(memcmp(request->body, "b=2", 3) == 0);
+            TEST_CHECK(request->path != NULL && strcmp(request->path, "/two") == 0);
+        }
+        else {
+            TEST_CHECK(0);
+        }
+        count++;
+    }
+    TEST_CHECK(count == 2);
+
+    flb_http_server_session_destroy(session);
 }
 
 static void test_http_body_inflation_budget(void)
@@ -1333,6 +1396,8 @@ TEST_LIST = {
     { "http1_rejects_invalid_partial_request_line", test_http1_rejects_invalid_partial_request_line },
     { "http1_header_limit_binary_units", test_http1_header_limit_binary_units },
     { "http1_fragmented_header_limit", test_http1_fragmented_header_limit },
+    { "http1_pipelined_body_is_clamped_to_content_length",
+      test_http1_pipelined_body_is_clamped_to_content_length },
     { "http_server_accept_reaps_stale_sessions_with_limit",
       test_http_server_accept_reaps_stale_sessions_with_limit },
     { "http_server_managed_accept_defers_uncapped_reaping",
