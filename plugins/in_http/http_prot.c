@@ -22,6 +22,7 @@
 #include <fluent-bit/flb_pack.h>
 
 #include <ctype.h>
+#include <string.h>
 
 #include <fluent-bit/flb_record_accessor.h>
 #include <fluent-bit/flb_ra_key.h>
@@ -397,6 +398,7 @@ static ssize_t parse_payload_urlencoded(struct flb_http *ctx,
     char **vals = NULL;
     char *sep;
     char *start;
+    char *body_copy = NULL;
     msgpack_packer pck;
     msgpack_sbuffer sbuf;
     const char *field_name;
@@ -405,7 +407,22 @@ static ssize_t parse_payload_urlencoded(struct flb_http *ctx,
     msgpack_sbuffer_init(&sbuf);
     msgpack_packer_init(&pck, &sbuf, msgpack_sbuffer_write);
 
-    kvs = flb_utils_split(payload, '&', -1 );
+    /*
+     * The payload buffer may hold more data than the declared body length
+     * (e.g. bytes from a pipelined request past Content-Length);
+     * flb_utils_split() is NUL-terminated rather than length-aware, so
+     * work on a private NUL-terminated copy bounded by 'size'.
+     */
+    body_copy = flb_malloc(size + 1);
+    if (body_copy == NULL) {
+        goto split_error;
+    }
+    memcpy(body_copy, payload, size);
+    body_copy[size] = '\0';
+
+    kvs = flb_utils_split(body_copy, '&', -1 );
+    flb_free(body_copy);
+    body_copy = NULL;
     if (kvs == NULL) {
         goto split_error;
     }
