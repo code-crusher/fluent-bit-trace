@@ -40,6 +40,10 @@
 
 /* Examples from RFCs */
 #define RFC5424_EXAMPLE_1 "<34>1 2003-10-11T22:14:15.003Z mymachine.example.com su - ID47 - 'su root' failed for lonvick on /dev/pts/8\n"
+#define RFC5424_EMPTY_MSG_HEADER "<13>1 2026-10-15T09:23:23.279036+00:00 en-0db1s4 " \
+                                 "root - - [timeQuality tzKnown=\"1\" isSynced=\"0\"]"
+#define RFC5424_EXAMPLE_EMPTY_MSG RFC5424_EMPTY_MSG_HEADER " \n"
+#define RFC5424_EXAMPLE_EMPTY_MSG_NO_SP RFC5424_EMPTY_MSG_HEADER "\n"
 #define RFC3164_EXAMPLE_1 "<34>Oct 11 22:14:15 mymachine su: 'su root' failed for lonvick on /dev/pts/8\n"
 
 char *RFC5424_EXPECTED_STRS_1[] = {"\"pri\":\"34\"", "\"message\":\"'su root' failed for lonvick on /dev/pts/8\"",
@@ -57,6 +61,13 @@ char *RFC5424_EXPECTED_STRS_UDP[] = {"\"pri\":\"34\"", "\"message\":\"'su root' 
                                      "\"host\":\"mymachine.example.com\"", "\"msgid\":\"ID47\"","\"time\":\"2003-10-11T22:14:15.003Z\"",
                                      "\"ident\":\"su\"",
                                      "\"source_host\":\"udp://"
+};
+
+char *RFC5424_EXPECTED_STRS_EMPTY_MSG[] = {"\"pri\":\"13\"", "\"message\":\"\"",
+                                           "\"host\":\"en-0db1s4\"", "\"msgid\":\"-\"",
+                                           "\"ident\":\"root\"",
+                                           "\"extradata\":\"[timeQuality "
+                                           "tzKnown=\\\"1\\\" isSynced=\\\"0\\\"]\""
 };
 
 char *RFC3164_EXPECTED_STRS_1[] = {"\"pri\":\"34\"", "\"message\":\"'su root' failed for lonvick on /dev/pts/8\"",
@@ -431,6 +442,82 @@ void flb_test_syslog_tcp()
 
     flb_socket_close(fd);
     test_ctx_destroy(ctx);
+}
+
+/*
+ * An RFC 5424 event can carry an empty MSG (issue #12583). Both forms are
+ * seen in practice: a trailing space after the structured data, and the
+ * header ending right after the structured data. The event must be kept
+ * with an empty "message" field instead of being dropped.
+ */
+static void run_empty_msg_test(const char *buf)
+{
+    struct flb_lib_out_cb cb_data;
+    struct test_ctx *ctx;
+    flb_sockfd_t fd;
+    int ret;
+    int num;
+    ssize_t w_size;
+    size_t size = strlen(buf);
+
+    struct str_list expected = {
+                                .size = sizeof(RFC5424_EXPECTED_STRS_EMPTY_MSG)/sizeof(char*),
+                                .lists = &RFC5424_EXPECTED_STRS_EMPTY_MSG[0],
+    };
+
+    clear_output_num();
+
+    cb_data.cb = cb_check_json_str_list;
+    cb_data.data = &expected;
+
+    ctx = test_ctx_create(&cb_data);
+    if (!TEST_CHECK(ctx != NULL)) {
+        TEST_MSG("test_ctx_create failed");
+        exit(EXIT_FAILURE);
+    }
+
+    ret = flb_input_set(ctx->flb, ctx->i_ffd,
+                        "mode", "tcp",
+                        "parser", PARSER_NAME_RFC5424,
+                         NULL);
+    TEST_CHECK(ret == 0);
+
+    ret = flb_start(ctx->flb);
+    TEST_CHECK(ret == 0);
+
+    fd = connect_tcp(NULL, -1);
+    if (!TEST_CHECK(fd >= 0)) {
+        test_ctx_destroy(ctx);
+        exit(EXIT_FAILURE);
+    }
+
+    w_size = send(fd, buf, size, 0);
+    if (!TEST_CHECK(w_size == size)) {
+        TEST_MSG("failed to send, errno=%d", errno);
+        flb_socket_close(fd);
+        test_ctx_destroy(ctx);
+        exit(EXIT_FAILURE);
+    }
+
+    flb_time_msleep(500);
+
+    num = get_output_num();
+    if (!TEST_CHECK(num > 0))  {
+        TEST_MSG("no outputs for empty message");
+    }
+
+    flb_socket_close(fd);
+    test_ctx_destroy(ctx);
+}
+
+void flb_test_syslog_tcp_empty_message()
+{
+    run_empty_msg_test(RFC5424_EXAMPLE_EMPTY_MSG);
+}
+
+void flb_test_syslog_tcp_empty_message_no_space()
+{
+    run_empty_msg_test(RFC5424_EXAMPLE_EMPTY_MSG_NO_SP);
 }
 
 void flb_test_syslog_tcp_port()
@@ -1598,6 +1685,8 @@ TEST_LIST = {
     {"syslog_tcp_zero_octet_count", flb_test_syslog_tcp_zero_octet_count},
     {"syslog_tcp_missing_octet_count", flb_test_syslog_tcp_missing_octet_count},
     {"syslog_tcp", flb_test_syslog_tcp},
+    {"syslog_tcp_empty_message", flb_test_syslog_tcp_empty_message},
+    {"syslog_tcp_empty_message_no_space", flb_test_syslog_tcp_empty_message_no_space},
     {"syslog_udp", flb_test_syslog_udp},
     {"syslog_tcp_port", flb_test_syslog_tcp_port},
     {"syslog_tcp_source_address", flb_test_syslog_tcp_source_address},
