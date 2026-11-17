@@ -20,6 +20,7 @@
 #ifndef FLB_HTTP_SERVER_HTTP1
 #define FLB_HTTP_SERVER_HTTP1
 
+#include <cfl/cfl_list.h>
 #include <monkey/mk_http.h>
 #include <monkey/mk_http_parser.h>
 #include <monkey/mk_utils.h>
@@ -37,7 +38,7 @@ struct flb_http1_server_session {
     size_t                          request_line_version_offset;
     int                             request_line_state;
     int                             headers_complete;
-    struct flb_http_stream          stream;
+    struct cfl_list                 streams;
     struct flb_http_server_session *parent;
 };
 

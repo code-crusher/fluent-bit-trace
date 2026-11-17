@@ -58,6 +58,31 @@ static void dummy_mk_http_request_init(struct mk_http_session *session,
     mk_http_request_init(session, request, session->server);
 }
 
+/*
+ * Return the size of the request currently tracked by the parser,
+ * measured from the start of incoming_data. For chunked transfer coding
+ * the parser keeps exact accounting, so defer to monkey's own helper.
+ * For a bodyless request this is the end of the header block.
+ */
+static size_t http1_request_wire_size(struct flb_http1_server_session *session)
+{
+    cfl_sds_t buf = session->parent->incoming_data;
+
+    if (mk_http_parser_is_content_chunked(&session->inner_parser)) {
+        return mk_http_parser_request_size(&session->inner_parser,
+                                           buf, cfl_sds_len(buf));
+    }
+
+    if (session->inner_parser.header_content_length > 0) {
+        return (size_t) session->inner_parser.start
+             + (size_t) session->inner_parser.header_content_length;
+    }
+
+    /* Bodyless request: parser returned OK from REQ_LEVEL_END with
+     * p->i pointing at the final LF of the header block. */
+    return (size_t) session->inner_parser.i + 1;
+}
+
 static int http1_evict_request(struct flb_http1_server_session *session)
 {
     size_t    session_buffer_length;
@@ -72,12 +97,9 @@ static int http1_evict_request(struct flb_http1_server_session *session)
 
     session_buffer_length = cfl_sds_len(session_buffer);
 
-    request_length = mk_http_parser_request_size(&session->inner_parser,
-                                                 session_buffer,
-                                                 session_buffer_length);
+    request_length = http1_request_wire_size(session);
 
-    if (request_length == -1 ||
-        request_length > session_buffer_length) {
+    if (request_length == (size_t) -1 || request_length > session_buffer_length) {
         cfl_sds_set_len(session_buffer, 0);
 
         return -1;
@@ -90,7 +112,7 @@ static int http1_evict_request(struct flb_http1_server_session *session)
                 &session_buffer[request_length],
                 session_buffer_length);
 
-        session_buffer[session_buffer_length] = '\0';
+        cfl_sds_set_len(session_buffer, session_buffer_length);
     }
     else {
         cfl_sds_set_len(session_buffer, 0);
@@ -103,86 +125,118 @@ static int http1_session_process_request(struct flb_http1_server_session *sessio
 {
     struct mk_list         *iterator;
     struct mk_http_header  *header;
+    struct flb_http_stream *stream;
+    void                   *user_data;
     int                     result;
     size_t chunked_size;
     size_t written_bytes = 0;
 
-    result = flb_http_request_init(&session->stream.request);
-
-    if (result != 0) {
-      return -1;
+    if (session->parent != NULL && session->parent->parent != NULL) {
+        user_data = session->parent->parent->user_data;
+    }
+    else {
+        user_data = NULL;
     }
 
-    session->stream.request.stream = &session->stream;
+    stream = flb_http_stream_create(session->parent,
+                                    0,
+                                    HTTP_STREAM_ROLE_SERVER,
+                                    user_data);
+
+    if (stream == NULL) {
+        return -1;
+    }
+
+    cfl_list_add(&stream->_head, &session->streams);
 
     if (session->inner_request.uri_processed.data != NULL) {
-        session->stream.request.path = \
+        stream->request.path = \
             cfl_sds_create_len(session->inner_request.uri_processed.data,
                                session->inner_request.uri_processed.len);
     }
     else {
-        session->stream.request.path = \
+        stream->request.path = \
             cfl_sds_create_len(session->inner_request.uri.data,
                                session->inner_request.uri.len);
     }
 
-    if (session->stream.request.path == NULL) {
-        return -1;
+    if (stream->request.path == NULL) {
+        result = -1;
+        goto request_error;
     }
 
     if (session->inner_request.query_string.len > 0) {
-        session->stream.request.query_string =
+        stream->request.query_string =
             cfl_sds_create_len(session->inner_request.query_string.data,
                                session->inner_request.query_string.len);
-        if (session->stream.request.query_string == NULL) {
-            return -1;
+        if (stream->request.query_string == NULL) {
+            goto request_error;
         }
     }
 
-    result = flb_http_request_normalize(&session->stream.request);
+    result = flb_http_request_normalize(&stream->request);
     if (result != 0) {
-        return -1;
+        goto request_error;
     }
 
     switch (session->inner_request.protocol) {
         case MK_HTTP_PROTOCOL_09:
-            session->stream.request.protocol_version = HTTP_PROTOCOL_VERSION_09;
+            stream->request.protocol_version = HTTP_PROTOCOL_VERSION_09;
             break;
         case MK_HTTP_PROTOCOL_10:
-            session->stream.request.protocol_version = HTTP_PROTOCOL_VERSION_10;
+            stream->request.protocol_version = HTTP_PROTOCOL_VERSION_10;
             break;
         case MK_HTTP_PROTOCOL_11:
-            session->stream.request.protocol_version = HTTP_PROTOCOL_VERSION_11;
+            stream->request.protocol_version = HTTP_PROTOCOL_VERSION_11;
             break;
         default:
-            session->stream.request.protocol_version = HTTP_PROTOCOL_VERSION_10;
+            stream->request.protocol_version = HTTP_PROTOCOL_VERSION_10;
     }
 
     switch (session->inner_request.method) {
         case MK_METHOD_GET:
-            session->stream.request.method = HTTP_METHOD_GET;
+            stream->request.method = HTTP_METHOD_GET;
             break;
         case MK_METHOD_POST:
-            session->stream.request.method = HTTP_METHOD_POST;
+            stream->request.method = HTTP_METHOD_POST;
             break;
         case MK_METHOD_HEAD:
-            session->stream.request.method = HTTP_METHOD_HEAD;
+            stream->request.method = HTTP_METHOD_HEAD;
             break;
         case MK_METHOD_PUT:
-            session->stream.request.method = HTTP_METHOD_PUT;
+            stream->request.method = HTTP_METHOD_PUT;
             break;
         case MK_METHOD_DELETE:
-            session->stream.request.method = HTTP_METHOD_DELETE;
+            stream->request.method = HTTP_METHOD_DELETE;
             break;
         case MK_METHOD_OPTIONS:
-            session->stream.request.method = HTTP_METHOD_OPTIONS;
+            stream->request.method = HTTP_METHOD_OPTIONS;
             break;
         default:
-            session->stream.request.method = HTTP_METHOD_UNKNOWN;
+            stream->request.method = HTTP_METHOD_UNKNOWN;
             break;
     }
 
-    session->stream.request.content_length = session->inner_request.content_length;
+    /*
+     * Monkey leaves mk_http_request.content_length at zero; the declared
+     * length lives on the parser. Keep the request consistent with the
+     * body that is actually delivered (clamped to the declared length).
+     */
+    if (mk_http_parser_is_content_chunked(&session->inner_parser)) {
+        stream->request.content_length =
+            mk_http_parser_content_length(&session->inner_parser);
+    }
+    else if (session->inner_parser.header_content_length > 0) {
+        stream->request.content_length =
+            (size_t) session->inner_parser.header_content_length;
+    }
+    else if (session->inner_request.data.data != NULL) {
+        stream->request.content_length =
+            session->inner_request.data.len;
+    }
+    else {
+        stream->request.content_length = 0;
+    }
 
     mk_list_foreach(iterator,
                     &session->inner_parser.header_list) {
@@ -195,44 +249,44 @@ static int http1_session_process_request(struct flb_http1_server_session *sessio
                     (const uint8_t *) header->key.data,
                     header->key.len,
                     "host", 0) == 0) {
-                session->stream.request.host = \
+                stream->request.host = \
                     cfl_sds_create_len((const char *) header->val.data,
                                        header->val.len);
 
-                if (session->stream.request.host == NULL) {
-                    return -1;
+                if (stream->request.host == NULL) {
+                    goto request_error;
                 }
             }
             else if (flb_http_server_strncasecmp(
                         (const uint8_t *) header->key.data,
                         header->key.len,
                         "content-type", 0) == 0) {
-                session->stream.request.content_type = \
+                stream->request.content_type = \
                     cfl_sds_create_len((const char *) header->val.data,
                                        header->val.len);
 
-                if (session->stream.request.content_type == NULL) {
-                    return -1;
+                if (stream->request.content_type == NULL) {
+                    goto request_error;
                 }
             }
 
-            result = flb_http_request_set_header(&session->stream.request,
+            result = flb_http_request_set_header(&stream->request,
                                                  header->key.data,
                                                  header->key.len,
                                                  (void *) header->val.data,
                                                  header->val.len);
 
             if (result != 0) {
-                return -1;
+                goto request_error;
             }
         }
     }
 
-    if (session->stream.request.host == NULL) {
-        session->stream.request.host = cfl_sds_create("");
+    if (stream->request.host == NULL) {
+        stream->request.host = cfl_sds_create("");
 
-        if (session->stream.request.host == NULL) {
-            return -1;
+        if (stream->request.host == NULL) {
+            goto request_error;
         }
     }
 
@@ -241,55 +295,74 @@ static int http1_session_process_request(struct flb_http1_server_session *sessio
         /* Get the total size of all the chunks */
         chunked_size = mk_http_parser_content_length(&session->inner_parser);
         if (chunked_size == 0) {
-            session->stream.status = HTTP_STREAM_STATUS_ERROR;
-            return -1;
+            goto request_error;
         }
 
         /* allocate a buffer to get a copy of the decoded chunks */
-        session->stream.request.body = cfl_sds_create_size(chunked_size);
-        if (!session->stream.request.body) {
-            session->stream.status = HTTP_STREAM_STATUS_ERROR;
-            return -1;
+        stream->request.body = cfl_sds_create_size(chunked_size);
+        if (!stream->request.body) {
+            goto request_error;
         }
 
         /* decode the data into the new buffer */
         result = mk_http_parser_chunked_decode_buf(&session->inner_parser,
                                                    session->parent->incoming_data,
                                                    cfl_sds_len(session->parent->incoming_data),
-                                                   session->stream.request.body,
+                                                   stream->request.body,
                                                    chunked_size,
                                                    &written_bytes);
         if (result == -1) {
-            session->stream.status = HTTP_STREAM_STATUS_ERROR;
-            cfl_sds_destroy(session->stream.request.body);
-            session->stream.request.body = NULL;
-            return -1;
+            cfl_sds_destroy(stream->request.body);
+            stream->request.body = NULL;
+            goto request_error;
         }
 
-        cfl_sds_len_set(session->stream.request.body, written_bytes);
+        cfl_sds_len_set(stream->request.body, written_bytes);
     }
     else if (session->inner_request.data.data != NULL) {
-        session->stream.request.body = \
+        size_t header_content_length = 0;
+        size_t body_len = session->inner_request.data.len;
+
+        /*
+         * Monkey's parser reports the whole remainder of the read buffer as
+         * the body, which can include bytes of a pipelined request past the
+         * declared Content-Length. Clamp the HTTP/1 body to the declared
+         * length so downstream consumers do not absorb pipelined requests.
+         */
+        if (session->inner_parser.header_content_length > 0) {
+            header_content_length =
+                (size_t) session->inner_parser.header_content_length;
+        }
+
+        if (header_content_length > 0 && body_len > header_content_length) {
+            body_len = header_content_length;
+        }
+
+        stream->request.body = \
             cfl_sds_create_len(session->inner_request.data.data,
-                               session->inner_request.data.len);
+                               body_len);
 
-        if (session->stream.request.body == NULL) {
-            session->stream.status = HTTP_STREAM_STATUS_ERROR;
+        if (stream->request.body == NULL) {
 
-            return -1;
+            goto request_error;
         }
     }
 
-    session->stream.status = HTTP_STREAM_STATUS_READY;
+    stream->status = HTTP_STREAM_STATUS_READY;
 
-    if (!cfl_list_entry_is_orphan(&session->stream.request._head)) {
-        cfl_list_del(&session->stream.request._head);
+    if (!cfl_list_entry_is_orphan(&stream->request._head)) {
+        cfl_list_del(&stream->request._head);
     }
 
-    cfl_list_add(&session->stream.request._head,
+    cfl_list_add(&stream->request._head,
                  &session->parent->request_queue);
 
     return 0;
+
+request_error:
+    flb_http_stream_destroy(stream);
+
+    return -1;
 }
 
 /* RESPONSE */
@@ -496,21 +569,13 @@ int flb_http1_response_set_body(struct flb_http_response *response,
 int flb_http1_server_session_init(struct flb_http1_server_session *session,
                        struct flb_http_server_session *parent)
 {
-    void *user_data;
-    int   result;
-
-    if (parent != NULL && parent->parent != NULL) {
-        user_data = parent->parent->user_data;
-    }
-    else {
-        user_data = NULL;
-    }
-
     session->initialized = FLB_TRUE;
     session->header_scan_offset = 0;
     session->request_line_version_offset = 0;
     session->request_line_state = MK_ST_REQ_METHOD;
     session->headers_complete = FLB_FALSE;
+
+    cfl_list_init(&session->streams);
 
     dummy_mk_http_session_init(&session->inner_session, &session->inner_server);
 
@@ -519,13 +584,6 @@ int flb_http1_server_session_init(struct flb_http1_server_session *session,
 
     mk_http_parser_init(&session->inner_parser);
 
-    result = flb_http_stream_init(&session->stream, parent, 0, HTTP_STREAM_ROLE_SERVER,
-                                  user_data);
-
-    if (result != 0) {
-        return -1;
-    }
-
     session->parent = parent;
 
     return 0;
@@ -533,6 +591,10 @@ int flb_http1_server_session_init(struct flb_http1_server_session *session,
 
 void flb_http1_server_session_destroy(struct flb_http1_server_session *session)
 {
+    struct cfl_list     *iterator;
+    struct cfl_list     *iterator_backup;
+    struct flb_http_stream *stream;
+
     if (session->initialized) {
         if (session->inner_session.channel != NULL) {
             mk_channel_release(session->inner_session.channel);
@@ -540,7 +602,13 @@ void flb_http1_server_session_destroy(struct flb_http1_server_session *session)
             session->inner_session.channel = NULL;
         }
 
-        flb_http_stream_destroy(&session->stream);
+        cfl_list_foreach_safe(iterator,
+                              iterator_backup,
+                              &session->streams) {
+            stream = cfl_list_entry(iterator, struct flb_http_stream, _head);
+
+            flb_http_stream_destroy(stream);
+        }
 
         session->initialized = FLB_FALSE;
     }
@@ -550,18 +618,25 @@ int flb_http1_server_session_ingest(struct flb_http1_server_session *session,
                                     unsigned char *buffer,
                                     size_t length)
 {
-    int result;
+    int result = MK_HTTP_PARSER_OK;
     size_t available;
     size_t header_limit;
     size_t offset;
     const char *data;
 
     /*
-     * Wait for a complete, bounded header block before invoking Monkey. Keep
-     * only an offset across reads: incoming_data can move when the SDS grows.
-     * Each new byte is examined once, even when CRLFCRLF spans several reads.
+     * HTTP/1 allows requests to share a connection (pipelining), so a single
+     * read may deliver several requests. Requests are parsed one at a time
+     * from the head of the receive buffer; each completed request is
+     * evicted from the head before the next one is considered.
      */
-    if (!session->headers_complete) {
+    for (;;) {
+        /*
+         * Wait for a complete, bounded header block before invoking Monkey.
+         * Keep only an offset across reads: incoming_data can move when the
+         * SDS grows. Each new byte is examined once, even when CRLFCRLF
+         * spans several reads.
+         */
         header_limit = HTTP_SERVER_DEFAULT_HTTP1_MAX_HEADER_SIZE;
         if (session->parent->parent != NULL &&
             session->parent->parent->http1_max_header_size > 0) {
@@ -571,94 +646,99 @@ int flb_http1_server_session_ingest(struct flb_http1_server_session *session,
         data = session->parent->incoming_data;
         available = cfl_sds_len(session->parent->incoming_data);
 
-        while (session->header_scan_offset < available &&
-               session->header_scan_offset < header_limit) {
-            offset = ++session->header_scan_offset;
+        if (!session->headers_complete) {
+            while (session->header_scan_offset < available &&
+                   session->header_scan_offset < header_limit) {
+                offset = ++session->header_scan_offset;
 
-            /* Preserve early request-line rejection while scanning only new bytes. */
-            if (session->request_line_state == MK_ST_REQ_METHOD) {
-                if (data[offset - 1] == ' ') {
-                    session->request_line_state = MK_ST_REQ_URI;
+                /* Preserve early request-line rejection while scanning only new bytes. */
+                if (session->request_line_state == MK_ST_REQ_METHOD) {
+                    if (data[offset - 1] == ' ') {
+                        session->request_line_state = MK_ST_REQ_URI;
+                    }
+                    else if (offset > 11) {
+                        /* Monkey rejects a non-space method byte at index > 10. */
+                        return HTTP_SERVER_PROVIDER_ERROR;
+                    }
                 }
-                else if (offset > 11) {
-                    /* Monkey rejects a non-space method byte at index > 10. */
-                    session->stream.status = HTTP_STREAM_STATUS_ERROR;
-                    return HTTP_SERVER_PROVIDER_ERROR;
+                else if (session->request_line_state == MK_ST_REQ_URI) {
+                    if (data[offset - 1] == ' ') {
+                        session->request_line_state = MK_ST_REQ_PROT_VERSION;
+                        session->request_line_version_offset = offset;
+                    }
+                    else if (data[offset - 1] == '\r' || data[offset - 1] == '\n') {
+                        return HTTP_SERVER_PROVIDER_ERROR;
+                    }
                 }
-            }
-            else if (session->request_line_state == MK_ST_REQ_URI) {
-                if (data[offset - 1] == ' ') {
-                    session->request_line_state = MK_ST_REQ_PROT_VERSION;
-                    session->request_line_version_offset = offset;
+                else if (session->request_line_state == MK_ST_REQ_PROT_VERSION &&
+                         offset - session->request_line_version_offset == 7) {
+                    /* Reject an invalid protocol as soon as its prefix is available. */
+                    if (memcmp(data + session->request_line_version_offset, "HTTP/1.", 7) != 0) {
+                        return HTTP_SERVER_PROVIDER_ERROR;
+                    }
+                    session->request_line_state = MK_ST_FIRST_CONTINUE;
                 }
-                else if (data[offset - 1] == '\r' || data[offset - 1] == '\n') {
-                    session->stream.status = HTTP_STREAM_STATUS_ERROR;
-                    return HTTP_SERVER_PROVIDER_ERROR;
+
+                if (offset >= 4 && memcmp(data + offset - 4, "\r\n\r\n", 4) == 0) {
+                    session->headers_complete = FLB_TRUE;
+                    break;
                 }
-            }
-            else if (session->request_line_state == MK_ST_REQ_PROT_VERSION &&
-                     offset - session->request_line_version_offset == 7) {
-                /* Reject an invalid protocol as soon as its prefix is available. */
-                if (memcmp(data + session->request_line_version_offset, "HTTP/1.", 7) != 0) {
-                    session->stream.status = HTTP_STREAM_STATUS_ERROR;
-                    return HTTP_SERVER_PROVIDER_ERROR;
-                }
-                session->request_line_state = MK_ST_FIRST_CONTINUE;
             }
 
-            if (offset >= 4 && memcmp(data + offset - 4, "\r\n\r\n", 4) == 0) {
-                session->headers_complete = FLB_TRUE;
-                break;
+            if (!session->headers_complete) {
+                if (session->header_scan_offset == header_limit) {
+                    return HTTP_SERVER_PROVIDER_ERROR;
+                }
+
+                return HTTP_SERVER_SUCCESS;
             }
         }
 
-        if (!session->headers_complete) {
-            if (session->header_scan_offset == header_limit) {
-                session->stream.status = HTTP_STREAM_STATUS_ERROR;
+        result = mk_http_parser(&session->inner_request,
+                                &session->inner_parser,
+                                (char *) session->parent->incoming_data,
+                                (int) cfl_sds_len(session->parent->incoming_data),
+                                &session->inner_server);
+
+        if (result == MK_HTTP_PARSER_OK) {
+            result = http1_session_process_request(session);
+
+            if (result != 0) {
                 return HTTP_SERVER_PROVIDER_ERROR;
             }
 
+            http1_evict_request(session);
+            dummy_mk_http_request_init(&session->inner_session,
+                                       &session->inner_request);
+            mk_http_parser_init(&session->inner_parser);
+            session->header_scan_offset = 0;
+            session->request_line_version_offset = 0;
+            session->request_line_state = MK_ST_REQ_METHOD;
+            session->headers_complete = FLB_FALSE;
+
+            /* Keep draining requests that were already received. */
+            if (cfl_sds_len(session->parent->incoming_data) == 0) {
+                return HTTP_SERVER_SUCCESS;
+            }
+
+            continue;
+        }
+        else if (result == MK_HTTP_PARSER_PENDING) {
+            /*
+             * The body is incomplete. Reset Monkey's pointers before the
+             * receive buffer can move. Header reparsing is bounded by the
+             * independent header limit; incomplete headers never reach this
+             * parser.
+             */
+            dummy_mk_http_request_init(&session->inner_session,
+                                       &session->inner_request);
+            mk_http_parser_init(&session->inner_parser);
+
             return HTTP_SERVER_SUCCESS;
         }
-    }
-
-    result = mk_http_parser(&session->inner_request,
-                            &session->inner_parser,
-                            session->parent->incoming_data,
-                            cfl_sds_len(session->parent->incoming_data),
-                            &session->inner_server);
-
-    if (result == MK_HTTP_PARSER_OK) {
-        result = http1_session_process_request(session);
-
-        if (result != 0) {
-            session->stream.status = HTTP_STREAM_STATUS_ERROR;
-
+        else if (result == MK_HTTP_PARSER_ERROR) {
+            /* The caller closes the session when a parser error is returned. */
             return HTTP_SERVER_PROVIDER_ERROR;
         }
-
-        http1_evict_request(session);
-        session->header_scan_offset = 0;
-        session->request_line_version_offset = 0;
-        session->request_line_state = MK_ST_REQ_METHOD;
-        session->headers_complete = FLB_FALSE;
     }
-    else if (result == MK_HTTP_PARSER_PENDING) {
-        /*
-         * The body is incomplete. Reset Monkey's pointers before the receive
-         * buffer can move. Header reparsing is bounded by the independent header
-         * limit; incomplete headers never reach this parser.
-         */
-    }
-    else if (result == MK_HTTP_PARSER_ERROR) {
-        /* The caller closes the session when a parser error is returned. */
-        session->stream.status = HTTP_STREAM_STATUS_ERROR;
-
-        return HTTP_SERVER_PROVIDER_ERROR;
-    }
-
-    dummy_mk_http_request_init(&session->inner_session, &session->inner_request);
-    mk_http_parser_init(&session->inner_parser);
-
-    return HTTP_SERVER_SUCCESS;
 }

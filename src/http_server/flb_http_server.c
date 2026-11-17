@@ -597,8 +597,7 @@ request_complete:
             flb_http2_server_stream_release(stream);
         }
         else {
-            flb_http_request_destroy(&stream->request);
-            flb_http_response_destroy(&stream->response);
+            flb_http_stream_destroy(stream);
         }
     }
 
@@ -654,10 +653,6 @@ static int flb_http_server_client_connection_initialize(
     if (server->handoff != NULL) {
         flb_http_server_counter_add(&server->handoff->connections, 1);
         session->balanced_connection = FLB_TRUE;
-    }
-
-    if (session->version <= HTTP_PROTOCOL_VERSION_11) {
-        session->http1.stream.user_data = server->user_data;
     }
 
     connection->user_data     = (void *) session;
