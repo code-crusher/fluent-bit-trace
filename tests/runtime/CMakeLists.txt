@@ -38,6 +38,7 @@ FLB_RT_TEST(FLB_CHUNK_TRACE "core_chunk_trace.c")
 
 # Input Plugins
 FLB_RT_TEST(FLB_IN_EVENT_TEST   "in_event_test.c")
+FLB_RT_TEST(FLB_IN_BLOB         "in_blob.c")
 # FLB_IN_WINEVTLOG is only enabled on Windows builds
 FLB_RT_TEST(FLB_IN_WINEVTLOG    "in_winevtlog.c")
 FLB_RT_TEST(FLB_IN_WINDOWS_EXPORTER_METRICS "in_windows_exporter_metrics_tcp.c")
