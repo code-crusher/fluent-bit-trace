@@ -509,6 +509,16 @@ static ssize_t recursive_file_search(struct blob_ctx *ctx,
 
             match_count += recursion_result;
 
+            /*
+             * When there is no remaining pattern the path below would be
+             * the directory itself, which was already scanned by the
+             * recursion above. Scanning it again would match the same
+             * directory and recurse on it forever, so skip it.
+             */
+            if (cfl_sds_len(local_pattern) == 0) {
+                continue;
+            }
+
             local_path[0] = '\0';
 
             cfl_sds_len_set(local_path, 0);
