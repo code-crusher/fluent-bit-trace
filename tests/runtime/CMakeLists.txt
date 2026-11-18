@@ -440,6 +440,10 @@ if(TEST flb-rt-output_throttle_runtime)
   set_tests_properties(flb-rt-output_throttle_runtime PROPERTIES TIMEOUT 120)
 endif()
 
+if(TEST flb-rt-in_blob)
+  set_tests_properties(flb-rt-in_blob PROPERTIES TIMEOUT 120)
+endif()
+
 function(flb_runtime_lock_tests resource_name)
   foreach(test_name ${ARGN})
     if (TEST ${test_name})
