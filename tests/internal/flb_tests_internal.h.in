@@ -41,5 +41,6 @@ static inline void fini_nop() {};
 
 #include "../lib/acutest/acutest.h"
 #define FLB_TESTS_DATA_PATH "@FLB_TESTS_DATA_PATH@"
+#define FLB_TESTS_SHIPPED_CONF_PATH "@FLB_TESTS_SHIPPED_CONF_PATH@"
 
 #endif

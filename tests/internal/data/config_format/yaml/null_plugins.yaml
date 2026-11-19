@@ -1,0 +1,3 @@
+# A 'plugins' key with a null value (no sequence) must not crash the
+# YAML parser: it means no external plugins were configured.
+plugins:

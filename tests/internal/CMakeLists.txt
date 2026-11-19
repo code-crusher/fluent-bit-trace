@@ -256,6 +256,7 @@ set(UNIT_TESTS_DATA
   )
 
 set(FLB_TESTS_DATA_PATH ${CMAKE_CURRENT_SOURCE_DIR}/)
+set(FLB_TESTS_SHIPPED_CONF_PATH ${PROJECT_SOURCE_DIR}/conf/)
 configure_file(
   "${CMAKE_CURRENT_SOURCE_DIR}/flb_tests_internal.h.in"
   "${CMAKE_CURRENT_SOURCE_DIR}/flb_tests_internal.h"

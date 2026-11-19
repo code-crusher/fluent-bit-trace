@@ -6,6 +6,7 @@
 #include <fluent-bit/flb_mem.h>
 #include <fluent-bit/flb_kv.h>
 #include <fluent-bit/flb_str.h>
+#include <fluent-bit/flb_lib.h>
 #include <fluent-bit/flb_config_format.h>
 
 #include <cfl/cfl.h>
@@ -1090,6 +1091,170 @@ static void test_include_hardlink_cycle()
 }
 #endif
 
+/*
+ * Default (shipped) configuration files
+ * ======================================
+ * New installations must ship the YAML equivalents of the classic '.conf'
+ * files (issue #12592), so validate the files under 'conf/' parse and
+ * expose the expected pipeline and parser definitions.
+ */
+
+#define FLB_SHIPPED_MAIN     FLB_TESTS_SHIPPED_CONF_PATH "fluent-bit.yaml"
+#define FLB_SHIPPED_PARSERS  FLB_TESTS_SHIPPED_CONF_PATH "parsers.yaml"
+#define FLB_SHIPPED_PLUGINS  FLB_TESTS_SHIPPED_CONF_PATH "plugins.yaml"
+
+static void test_shipped_main_yaml()
+{
+    struct flb_cf *cf;
+    struct cfl_variant *v;
+    flb_ctx_t *ctx;
+    int parsers;
+    int ret;
+
+    cf = flb_cf_yaml_create(NULL, FLB_SHIPPED_MAIN, NULL, 0);
+    if (!TEST_CHECK(cf != NULL)) {
+        return;
+    }
+
+    /* the classic 'fluent-bit.conf' service properties must be present */
+    if (!TEST_CHECK(cf->service != NULL)) {
+        flb_cf_destroy(cf);
+        return;
+    }
+
+    v = flb_cf_section_property_get(cf, cf->service, "flush");
+    TEST_CHECK(v != NULL && strcmp(v->data.as_string, "1") == 0);
+
+    v = flb_cf_section_property_get(cf, cf->service, "parsers_file");
+    TEST_CHECK(v != NULL && strcmp(v->data.as_string, "parsers.yaml") == 0);
+
+    v = flb_cf_section_property_get(cf, cf->service, "plugins_file");
+    TEST_CHECK(v != NULL && strcmp(v->data.as_string, "plugins.yaml") == 0);
+
+    /* default pipeline: one input (cpu) and one output (stdout) */
+    TEST_CHECK(mk_list_size(&cf->inputs) == 1);
+    TEST_CHECK(mk_list_size(&cf->outputs) == 1);
+
+    flb_cf_destroy(cf);
+
+    /*
+     * Full load: the shipped file must configure the engine through the
+     * public library lifecycle, including the parsers and plugins files
+     * referenced by the service section.
+     */
+    ctx = flb_create();
+    if (!TEST_CHECK(ctx != NULL)) {
+        return;
+    }
+    ctx->config->conf_path = flb_strdup(FLB_TESTS_SHIPPED_CONF_PATH);
+
+    /* baseline before the shipped parsers file is loaded */
+    parsers = mk_list_size(&ctx->config->parsers);
+
+    ret = flb_lib_config_file(ctx, (char *) FLB_SHIPPED_MAIN);
+    if (!TEST_CHECK(ret == 0)) {
+        flb_destroy(ctx);
+        return;
+    }
+
+    /* the shipped 'parsers.yaml' definitions must have been registered */
+    if (!TEST_CHECK(mk_list_size(&ctx->config->parsers) == parsers + 18)) {
+        TEST_MSG("expected %d registered parsers, got %d",
+                 parsers + 18, mk_list_size(&ctx->config->parsers));
+    }
+
+    ret = flb_start(ctx);
+    if (!TEST_CHECK(ret == 0)) {
+        flb_stop(ctx);
+        flb_destroy(ctx);
+        return;
+    }
+
+    /* default pipeline: one input (cpu) and one output (stdout) */
+    TEST_CHECK(mk_list_size(&ctx->config->inputs) == 1);
+    TEST_CHECK(mk_list_size(&ctx->config->outputs) == 1);
+
+    flb_stop(ctx);
+    flb_destroy(ctx);
+}
+
+static void test_shipped_parsers_yaml()
+{
+    struct mk_list *head;
+    struct flb_cf *cf;
+    struct flb_cf_section *s;
+    struct cfl_variant *v;
+    flb_sds_t name;
+    int found = 0;
+
+    cf = flb_cf_yaml_create(NULL, FLB_SHIPPED_PARSERS, NULL, 0);
+    if (!TEST_CHECK(cf != NULL)) {
+        return;
+    }
+
+    /*
+     * the shipped parsers file must provide the same set of parsers as
+     * the classic 'parsers.conf' (18 entries).
+     */
+    if (!TEST_CHECK(mk_list_size(&cf->parsers) == 18)) {
+        TEST_MSG("expected 18 parsers, got %d", mk_list_size(&cf->parsers));
+        flb_cf_destroy(cf);
+        return;
+    }
+
+    mk_list_foreach(head, &cf->parsers) {
+        s = mk_list_entry(head, struct flb_cf_section, _head_section);
+        name = flb_cf_section_property_get_string(cf, s, "name");
+        if (!TEST_CHECK(name != NULL)) {
+            continue;
+        }
+
+        if (strcmp(name, "cri") == 0) {
+            found = 1;
+            v = flb_cf_section_property_get(cf, s, "format");
+            TEST_CHECK(v != NULL && strcmp(v->data.as_string, "regex") == 0);
+        }
+        flb_sds_destroy(name);
+    }
+    TEST_CHECK(found == 1);
+
+    flb_cf_destroy(cf);
+}
+
+static void test_shipped_plugins_yaml()
+{
+    struct flb_cf *cf;
+
+    /*
+     * the shipped plugins file only contains commented out entries, so its
+     * 'plugins' key resolves to a null value: it must parse without
+     * crashing and register no plugin paths.
+     */
+    cf = flb_cf_yaml_create(NULL, FLB_SHIPPED_PLUGINS, NULL, 0);
+    if (!TEST_CHECK(cf != NULL)) {
+        return;
+    }
+
+    TEST_CHECK(mk_list_size(&cf->plugins) == 0);
+
+    flb_cf_destroy(cf);
+}
+
+/* data/config_format/yaml/null_plugins.yaml */
+static void test_plugins_null_value()
+{
+    struct flb_cf *cf;
+
+    cf = flb_cf_yaml_create(NULL, FLB_TESTS_CONF_PATH "/null_plugins.yaml", NULL, 0);
+    if (!TEST_CHECK(cf != NULL)) {
+        return;
+    }
+
+    TEST_CHECK(mk_list_size(&cf->plugins) == 0);
+
+    flb_cf_destroy(cf);
+}
+
 TEST_LIST = {
 #ifdef FLB_SYSTEM_WINDOWS
     { "include_hardlink_cycle", test_include_hardlink_cycle},
@@ -1110,5 +1275,9 @@ TEST_LIST = {
     { "other_nested_map_rejected", test_other_nested_map_rejected},
     { "invalid_input_property", test_invalid_property},
     { "caller_owned_error", test_caller_owned_error},
+    { "shipped_main_yaml", test_shipped_main_yaml},
+    { "shipped_parsers_yaml", test_shipped_parsers_yaml},
+    { "shipped_plugins_yaml", test_shipped_plugins_yaml},
+    { "plugins_null_value", test_plugins_null_value},
     { 0 }
 };
