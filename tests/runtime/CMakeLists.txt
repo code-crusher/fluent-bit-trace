@@ -47,6 +47,10 @@ if(FLB_OUT_LIB)
     FLB_RT_TEST(FLB_IN_NODE_EXPORTER_METRICS "in_node_exporter_metrics.c")
   endif()
 
+  if(FLB_IN_BLOB)
+    FLB_RT_TEST(FLB_IN_BLOB            "in_blob.c")
+  endif()
+
   # These plugins works only on Linux
   if(${CMAKE_SYSTEM_NAME} MATCHES "Linux")
     FLB_RT_TEST(FLB_IN_CPU            "in_cpu.c")
