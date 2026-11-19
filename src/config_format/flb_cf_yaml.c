@@ -1524,12 +1524,50 @@ static int consume_event(struct flb_cf *conf, struct local_ctx *ctx,
             break;
 
         case YAML_SCALAR_EVENT:
-            /* Store the path as an entry in the plugins section */
             value = (char *) event->data.scalar.value;
 
             /*
-             * note that we pass an empty string as the real value since this is
-             * a list of items.
+             * A null or empty value (e.g: 'plugins:' followed only by
+             * commented out entries) means no external plugins were
+             * configured: pop back and wait for the next section key.
+             */
+            if (state->cf_section == NULL) {
+                if (value[0] == '\0') {
+                    state = state_pop(ctx);
+                    if (!state) {
+                        flb_error("No state left");
+                        return YAML_FAILURE;
+                    }
+                    break;
+                }
+
+                /*
+                 * A single path given without a sequence is also accepted:
+                 * register it and pop back since no sequence follows.
+                 */
+                if (add_section_type(conf, state) == -1) {
+                    flb_error("Unable to add plugins section");
+                    return YAML_FAILURE;
+                }
+
+                if (flb_cf_section_property_add(conf, state->cf_section->properties,
+                                                value, strlen(value), "", 0) == NULL) {
+                    flb_error("Unable to add plugin path");
+                    return YAML_FAILURE;
+                }
+
+                state = state_pop(ctx);
+                if (!state) {
+                    flb_error("No state left");
+                    return YAML_FAILURE;
+                }
+                break;
+            }
+
+            /*
+             * Store the path as an entry in the plugins section, note that we
+             * pass an empty string as the real value since this is a list of
+             * items.
              */
             if (flb_cf_section_property_add(conf, state->cf_section->properties,
                                             value, strlen(value), "", 0) == NULL) {
