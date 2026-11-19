@@ -1891,55 +1891,109 @@ static int azb_timer_create(struct flb_azure_blob *ctx)
 }
 
 /*
- * Wait without blocking other workers from buffering. The caller holds
- * buffer_mutex, and the file stays locked until this callback finishes with it.
- * Return a refreshed list cursor because other files may have been removed
- * while the mutex was released.
+ * Upload a single buffer file with the lock released so other workers can
+ * keep buffering. The caller holds buffer_mutex, the file is not locked, and
+ * buffer_mutex is still held on return.
+ *
+ * Returns FLB_OK on success, FLB_RETRY on failure. 'failures' is bumped on
+ * every failure so the caller can honor the retry budget.
  */
-static struct mk_list *azure_blob_retry_wait(struct flb_azure_blob *ctx,
-                                   struct azure_blob_file *file,
-                                   unsigned int delay)
+static int azure_blob_upload_file(struct flb_azure_blob *ctx,
+                                  struct flb_config *config,
+                                  struct azure_blob_file *file,
+                                  struct flb_fstore_file *fsf)
 {
-    azure_blob_store_file_lock(file);
-    pthread_mutex_unlock(&ctx->buffer_mutex);
-    sleep(delay);
-    pthread_mutex_lock(&ctx->buffer_mutex);
-
-    return file->fsf->_head.next;
-}
-
-/**
- * Azure Blob Storage ingestion callback function
- * This function handles the upload of data chunks to Azure Blob Storage with retry mechanism
- * @param config: Fluent Bit configuration
- * @param data: Azure Blob context data
- */
-static void cb_azure_blob_ingest(struct flb_config *config, void *data) {
-    /* Initialize context and file handling variables */
-    struct flb_azure_blob *ctx = data;
-    struct azure_blob_file *file = NULL;
-    struct flb_fstore_file *fsf;
+    int ret;
     char *buffer = NULL;
     size_t buffer_size = 0;
-    struct mk_list *tmp;
-    struct mk_list *head;
-    int ret;
-    time_t now;
     flb_sds_t payload;
     flb_sds_t tag_sds;
 
-    /* Retry mechanism configuration */
-    int retry_count;
-    int backoff_time;
-    const int max_backoff_time = 64;  /* Maximum backoff time in seconds */
+    ret = construct_request_buffer(ctx, NULL, file, &buffer, &buffer_size);
+    if (ret < 0) {
+        flb_plg_error(ctx->ins, "Could not construct request buffer for %s",
+                      file->fsf->name);
+        azure_blob_store_file_unlock(file);
+        file->failures++;
+        return FLB_RETRY;
+    }
+
+    payload = flb_sds_create_len(buffer, buffer_size);
+    tag_sds = flb_sds_create(fsf->meta_buf);
+    flb_free(buffer);
+    if (!payload || !tag_sds) {
+        flb_plg_error(ctx->ins, "Could not allocate upload payload for %s",
+                      file->fsf->name);
+        if (payload) {
+            flb_sds_destroy(payload);
+        }
+        if (tag_sds) {
+            flb_sds_destroy(tag_sds);
+        }
+        azure_blob_store_file_unlock(file);
+        file->failures++;
+        return FLB_RETRY;
+    }
+
+    /*
+     * Release buffer_mutex while the request is on the wire so flush
+     * callbacks can keep buffering.
+     */
+    pthread_mutex_unlock(&ctx->buffer_mutex);
+    ret = send_blob(config, NULL, ctx, FLB_EVENT_TYPE_LOGS, ctx->btype,
+                    (char *) tag_sds, 0, (char *) tag_sds,
+                    flb_sds_len(tag_sds), NULL, payload, flb_sds_len(payload));
+    pthread_mutex_lock(&ctx->buffer_mutex);
+
+    flb_sds_destroy(payload);
+    flb_sds_destroy(tag_sds);
+
+    if (ret != FLB_OK) {
+        flb_plg_error(ctx->ins, "Failed to ingest data to Azure Blob Storage (%s)",
+                      file->fsf->name);
+        azure_blob_store_file_unlock(file);
+        file->failures++;
+        return FLB_RETRY;
+    }
+
+    flb_plg_debug(ctx->ins, "deleting successfully ingested file %s",
+                  fsf->name);
+    ret = azure_blob_store_file_delete(ctx, file);
+    if (ret != 0) {
+        flb_plg_error(ctx->ins, "failed to delete ingested file %s", fsf->name);
+        azure_blob_store_file_unlock(file);
+        file->failures++;
+        return FLB_RETRY;
+    }
+
+    return FLB_OK;
+}
+
+/*
+ * Azure Blob Storage upload timer callback.
+ *
+ * Each timer tick makes at most one non-blocking upload attempt per timed-out
+ * buffer file: failures are recorded in the per-file 'failures' counter and
+ * retried on the next tick instead of sleeping in place, so the worker event
+ * loop stays free to flush and buffer while the endpoint is slow or failing.
+ * The caller runs with buffer_mutex unlocked and it stays unlocked on return.
+ *
+ * @param config: Fluent Bit configuration
+ * @param data: Azure Blob context data
+ */
+static void cb_azure_blob_ingest(struct flb_config *config, void *data)
+{
+    struct flb_azure_blob *ctx = data;
+    struct azure_blob_file *file;
+    struct flb_fstore_file *fsf;
+    struct mk_list *tmp;
+    struct mk_list *head;
+    time_t now;
 
     pthread_mutex_lock(&ctx->buffer_mutex);
 
-    /* Log entry point and container information */
     flb_plg_debug(ctx->ins, "Running upload timer callback (cb_azure_blob_ingest)..");
 
-    /* Initialize jitter for retry mechanism */
-    srand(time(NULL));
     now = time(NULL);
 
     /* Iterate through all chunks in the active stream */
@@ -1947,9 +2001,9 @@ static void cb_azure_blob_ingest(struct flb_config *config, void *data) {
         fsf = mk_list_entry(head, struct flb_fstore_file, _head);
         file = fsf->data;
 
-        /* Debug logging for current file processing */
-        flb_plg_debug(ctx->ins, "Iterating files inside upload timer callback (cb_azure_blob_ingest).. %s",
-                      file->fsf->name);
+        if (file == NULL) {
+            continue;
+        }
 
         /* Skip if chunk hasn't timed out yet */
         if (now < (file->create_time + ctx->upload_timeout + ctx->retry_time)) {
@@ -1957,105 +2011,27 @@ static void cb_azure_blob_ingest(struct flb_config *config, void *data) {
         }
 
         /* Skip if file is already being processed */
-        flb_plg_debug(ctx->ins, "cb_azure_blob_ingest :: Before file locked check %s", file->fsf->name);
         if (file->locked == FLB_TRUE) {
             continue;
         }
 
-        /* Initialize retry mechanism parameters */
-        retry_count = 0;
-        backoff_time = 2;  /* Initial backoff time in seconds */
-
-        /* Retry loop for upload attempts */
-        while (retry_count < ctx->scheduler_max_retries) {
-            /* Construct request buffer for upload */
-            flb_plg_debug(ctx->ins, "cb_azure_blob_ingest :: Before construct_request_buffer %s", file->fsf->name);
-            ret = construct_request_buffer(ctx, NULL, file, &buffer, &buffer_size);
-
-            /* Handle request buffer construction failure */
-            if (ret < 0) {
-                flb_plg_error(ctx->ins, "cb_azure_blob_ingest :: Could not construct request buffer for %s",
-                              file->fsf->name);
-                retry_count++;
-
-                /* Implement exponential backoff with jitter */
-                int jitter = rand() % backoff_time;
-                flb_plg_warn(ctx->ins, "cb_azure_blob_ingest :: failure in construct_request_buffer :: Retrying in %d seconds (attempt %d of %d) with jitter %d for file %s",
-                             backoff_time + jitter, retry_count, ctx->scheduler_max_retries, jitter, file->fsf->name);
-                tmp = azure_blob_retry_wait(ctx, file, backoff_time + jitter);
-                backoff_time = (backoff_time * 2 < max_backoff_time) ? backoff_time * 2 : max_backoff_time;
-                continue;
-            }
-
-            /* Create payload and tags for blob upload */
-            payload = flb_sds_create_len(buffer, buffer_size);
-            tag_sds = flb_sds_create(fsf->meta_buf);
-            flb_plg_debug(ctx->ins, "cb_azure_blob_ingest ::: tag of the file %s", tag_sds);
-
-            /* Keep the file owned while other workers buffer during the upload. */
-            pthread_mutex_unlock(&ctx->buffer_mutex);
-            ret = send_blob(config, NULL, ctx, FLB_EVENT_TYPE_LOGS,ctx->btype , (char *) tag_sds,0, (char *) tag_sds,
-                            flb_sds_len(tag_sds), NULL, payload, flb_sds_len(payload));
-            pthread_mutex_lock(&ctx->buffer_mutex);
-            tmp = fsf->_head.next;
-
-            /* Handle blob send failure */
-            if (ret != FLB_OK) {
-                /* Clean up resources and update failure count */
-                flb_plg_error(ctx->ins, "cb_azure_blob_ingest :: Failed to ingest data to Azure Blob Storage (attempt %d of %d)",
-                              retry_count + 1, ctx->scheduler_max_retries);
-                flb_free(buffer);
-                flb_sds_destroy(payload);
-                flb_sds_destroy(tag_sds);
-
-                if (file) {
-                    azure_blob_store_file_unlock(file);
-                    file->failures += 1;
-                }
-
-                retry_count++;
-
-                /* Implement exponential backoff with jitter for retry */
-                int jitter = rand() % backoff_time;
-                flb_plg_warn(ctx->ins, "cb_azure_blob_ingest :: error sending blob :: Retrying in %d seconds (attempt %d of %d) with jitter %d for file %s",
-                             backoff_time + jitter, retry_count, ctx->scheduler_max_retries, jitter, file->fsf->name);
-                tmp = azure_blob_retry_wait(ctx, file, backoff_time + jitter);
-                backoff_time = (backoff_time * 2 < max_backoff_time) ? backoff_time * 2 : max_backoff_time;
-                continue;
-            }
-
-            /* Handle successful upload */
-            flb_plg_debug(ctx->ins, "cb_azure_blob_ingest :: deleting successfully ingested file %s",
-                          fsf->name);
-            ret = azure_blob_store_file_delete(ctx, file);
-            if (ret != 0) {
-                flb_plg_error(ctx->ins, "cb_azure_blob_ingest :: failed to delete ingested file %s", fsf->name);
-                if (file) {
-                    azure_blob_store_file_unlock(file);
-                    file->failures += 1;
-                }
-            }
-
-            /* Clean up resources */
-            flb_free(buffer);
-            flb_sds_destroy(payload);
-            flb_sds_destroy(tag_sds);
-            break;
-        }
-
-        /* Ensure file is unlocked if max retries reached */
-        if (retry_count >= ctx->scheduler_max_retries) {
-            flb_plg_error(ctx->ins, "cb_azure_blob_ingest :: Max retries reached for file :: attempting to delete/marking inactive %s",
-                          file->fsf->name);
-            if (ctx->delete_on_max_upload_error){
+        /* Skip files that exhausted their retry budget */
+        if (file->failures >= ctx->scheduler_max_retries) {
+            flb_plg_warn(ctx->ins,
+                         "Buffer file for tag %s failed to send %d times, "
+                         "will not retry",
+                         (char *) fsf->meta_buf, ctx->scheduler_max_retries);
+            if (ctx->delete_on_max_upload_error) {
                 azure_blob_store_file_delete(ctx, file);
             }
             else {
                 azure_blob_store_file_inactive(ctx, file);
             }
+            continue;
         }
 
-        flb_plg_debug(ctx->ins, "Exited upload timer callback (cb_azure_blob_ingest)..");
+        /* One attempt per tick: never sleep while the worker loop is waiting */
+        azure_blob_upload_file(ctx, config, file, fsf);
     }
     pthread_mutex_unlock(&ctx->buffer_mutex);
 }
@@ -2273,6 +2249,11 @@ static void cb_azure_blob_flush(struct flb_event_chunk *event_chunk,
                 } else if (upload_file->size + json_size > ctx->file_size) {
                     total_file_size_check = FLB_TRUE;
                 }
+            }
+
+            if (ctx->upload_on_flush == FLB_FALSE) {
+                upload_timeout_check = FLB_FALSE;
+                total_file_size_check = FLB_FALSE;
             }
 
             if (upload_file != NULL && (upload_timeout_check == FLB_TRUE || total_file_size_check == FLB_TRUE)) {
@@ -2636,6 +2617,14 @@ static struct flb_config_map config_map[] = {
      FLB_CONFIG_MAP_BOOL, "buffering_enabled", "false",
      0, FLB_TRUE, offsetof(struct flb_azure_blob, buffering_enabled),
      "Enable buffering into disk before ingesting into Azure Blob"
+    },
+
+    {
+     FLB_CONFIG_MAP_BOOL, "upload_on_flush", "true",
+     0, FLB_TRUE, offsetof(struct flb_azure_blob, upload_on_flush),
+     "Upload buffer files from the flush callback when they reach "
+     "upload_timeout or upload_file_size. When disabled, only the upload "
+     "timer uploads buffer files, keeping slow endpoints off the flush path"
     },
 
     {

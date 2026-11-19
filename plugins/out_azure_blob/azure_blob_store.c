@@ -187,6 +187,16 @@ int azure_blob_store_buffer_put(struct flb_azure_blob *ctx, struct azure_blob_fi
         return -1;
     }
 
+    /*
+     * Append leaves the chunk mapped ('up') because the file was already up
+     * when the append started. Put it back down so buffered files stay on
+     * disk instead of holding memory mappings against process RSS.
+     */
+    if (azure_blob_file->fsf->chunk != NULL &&
+        cio_chunk_is_up(azure_blob_file->fsf->chunk) == CIO_TRUE) {
+        cio_chunk_down(azure_blob_file->fsf->chunk);
+    }
+
     azure_blob_file->size += bytes;
     ctx->current_buffer_size += bytes;
 

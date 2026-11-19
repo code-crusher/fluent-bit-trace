@@ -689,6 +689,11 @@ struct flb_azure_blob *flb_azure_blob_conf_create(struct flb_output_instance *in
         return NULL;
     }
 
+    /* Upload-on-flush only applies while buffering */
+    if (ctx->buffering_enabled == FLB_FALSE) {
+        ctx->upload_on_flush = FLB_FALSE;
+    }
+
     /* Compress payload over the wire */
     tmp = (char *) flb_output_get_property("compress", ins);
     ctx->compression = FLB_COMPRESSION_ALGORITHM_NONE;
