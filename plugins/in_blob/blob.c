@@ -509,6 +509,20 @@ static ssize_t recursive_file_search(struct blob_ctx *ctx,
 
             match_count += recursion_result;
 
+            /*
+             * Apply the remaining pattern at this level so patterns such as
+             * "path" followed by the recursion wildcard and a name pattern
+             * can match entries of intermediate directories.
+             *
+             * When the remaining pattern is empty (or just a slash), the
+             * generated path is the plain directory itself: globbing it
+             * returns the directory again and this branch re-enters itself
+             * without ever making progress, hanging the scan (issue #12554).
+             */
+            if (cfl_sds_len(local_pattern) <= 1) {
+                continue;
+            }
+
             local_path[0] = '\0';
 
             cfl_sds_len_set(local_path, 0);
