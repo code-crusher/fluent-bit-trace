@@ -1,0 +1,17 @@
+# Fluent Bit YAML plugins file
+# ============================
+# This file is the YAML equivalent of 'plugins.conf'. Reference it from the
+# main configuration file using the 'plugins_file' service property:
+#
+#     service:
+#         plugins_file: plugins.yaml
+#
+# List the absolute paths of external plugins to load, e.g:
+#
+#     plugins:
+#         - /path/to/out_gstdout.so
+#
+# https://docs.fluentbit.io/manual/administration/configuring-fluent-bit/classic-mode#plugins-section
+
+plugins:
+    # - /path/to/out_gstdout.so

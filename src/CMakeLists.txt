@@ -746,4 +746,41 @@ if(FLB_BINARY)
     COMPONENT binary
     DESTINATION ${FLB_INSTALL_CONFDIR})
 
+  # YAML configuration files
+  #
+  # The classic '.conf' files are scheduled for deprecation at the end of
+  # 2026, so ship their YAML equivalents to let new deployments start on
+  # the YAML format out of the box (issue #12592).
+  if(FLB_CONFIG_YAML)
+    if(FLB_SYSTEM_WINDOWS)
+      install(FILES
+        "${PROJECT_SOURCE_DIR}/conf/fluent-bit-win32.yaml"
+        DESTINATION ${FLB_INSTALL_CONFDIR}
+        COMPONENT binary
+        RENAME "${FLB_OUT_NAME}.yaml")
+    elseif(FLB_SYSTEM_MACOS)
+      install(FILES
+        "${PROJECT_SOURCE_DIR}/conf/fluent-bit-macos.yaml"
+        DESTINATION ${FLB_INSTALL_CONFDIR}
+        COMPONENT binary
+        RENAME "${FLB_OUT_NAME}.yaml")
+    else()
+      install(FILES
+        "${PROJECT_SOURCE_DIR}/conf/fluent-bit.yaml"
+        DESTINATION ${FLB_INSTALL_CONFDIR}
+        COMPONENT binary
+        RENAME "${FLB_OUT_NAME}.yaml")
+    endif()
+
+    install(FILES
+      "${PROJECT_SOURCE_DIR}/conf/parsers.yaml"
+      COMPONENT binary
+      DESTINATION ${FLB_INSTALL_CONFDIR})
+
+    install(FILES
+      "${PROJECT_SOURCE_DIR}/conf/plugins.yaml"
+      COMPONENT binary
+      DESTINATION ${FLB_INSTALL_CONFDIR})
+  endif()
+
 endif()

@@ -1868,6 +1868,16 @@ set(CPACK_RPM_RUNTIME_USER_FILELIST
   "%ignore /opt"
   "%ignore /etc")
 
+# YAML configuration files are installed only when the YAML config format
+# support is built in (FLB_CONFIG_YAML), so register them as configuration
+# files only in that case.
+if(FLB_CONFIG_YAML)
+  list(APPEND CPACK_RPM_RUNTIME_USER_FILELIST
+    "%config(noreplace) /etc/${FLB_OUT_NAME}/${FLB_OUT_NAME}.yaml"
+    "%config(noreplace) /etc/${FLB_OUT_NAME}/parsers.yaml"
+    "%config(noreplace) /etc/${FLB_OUT_NAME}/plugins.yaml")
+endif()
+
 set(CPACK_RPM_PACKAGE_AUTOREQ ON)
 set(CPACK_RPM_RUNTIME_PACKAGE_NAME "${CPACK_PACKAGE_NAME}")
 set(CPACK_RPM_HEADERS_FILE_NAME "${CPACK_PACKAGE_NAME}-${CPACK_PACKAGE_VERSION}-${CPACK_PACKAGE_RELEASE}.${CMAKE_SYSTEM_PROCESSOR}-headers.rpm")
