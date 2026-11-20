@@ -382,6 +382,92 @@ static void *drain_nonblocking_peer(void *data)
     return NULL;
 }
 
+struct drain_context {
+    int fd;
+    size_t expected;
+};
+
+/* Drain the peer after a short delay so the writer has to wait for POLLOUT. */
+static void *drain_slow_peer(void *data)
+{
+    struct drain_context *context = data;
+    ssize_t ret;
+    size_t total = 0;
+    int retries = 0;
+    char buffer[4096];
+
+    flb_time_msleep(20);
+    while (total < context->expected) {
+        ret = recv(context->fd, buffer, sizeof(buffer), 0);
+        if (ret > 0) {
+            total += ret;
+            retries = 0;
+        }
+        else if (ret == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            /* Give up instead of hanging the test if the write never lands. */
+            if (retries++ == 5000) {
+                break;
+            }
+            flb_time_msleep(1);
+        }
+        else {
+            break;
+        }
+    }
+
+    return NULL;
+}
+
+/*
+ * A nonblocking writer that hits EAGAIN must wait for writability instead of
+ * sleeping for a full second, otherwise repeated backpressure adds seconds to
+ * the write. See https://github.com/fluent/fluent-bit/issues/12115.
+ */
+static void test_nonblocking_send_waits_for_writability(void)
+{
+    int ret;
+    int pair[2];
+    int buffer_size = 4096;
+    char payload[16384] = {0};
+    size_t written = 0;
+    struct flb_time start;
+    struct flb_time end;
+    double elapsed;
+    pthread_t reader;
+    struct drain_context reader_context;
+
+    ret = socketpair(AF_UNIX, SOCK_STREAM, 0, pair);
+    if (!TEST_CHECK(ret == 0)) {
+        return;
+    }
+
+    TEST_CHECK(setsockopt(pair[0], SOL_SOCKET, SO_SNDBUF,
+                         &buffer_size, sizeof(buffer_size)) == 0);
+    TEST_CHECK(flb_net_socket_nonblocking(pair[0]) == 0);
+    TEST_CHECK(flb_net_socket_nonblocking(pair[1]) == 0);
+    TEST_CHECK(flb_net_socket_set_sndtimeout(pair[0], 1) == 0);
+
+    reader_context.fd = pair[1];
+    reader_context.expected = sizeof(payload);
+
+    ret = pthread_create(&reader, NULL, drain_slow_peer, &reader_context);
+    if (TEST_CHECK(ret == 0)) {
+        flb_time_get(&start);
+        ret = flb_io_fd_write(pair[0], payload, sizeof(payload), &written);
+        flb_time_get(&end);
+        TEST_CHECK(ret == sizeof(payload));
+        TEST_CHECK(written == sizeof(payload));
+        elapsed = flb_time_to_double(&end) - flb_time_to_double(&start);
+        TEST_CHECK(elapsed < 0.9);
+        TEST_MSG("nonblocking write of %zu bytes took %.3f seconds",
+                 written, elapsed);
+        pthread_join(reader, NULL);
+    }
+
+    flb_socket_close(pair[0]);
+    flb_socket_close(pair[1]);
+}
+
 /* Transient nonblocking backpressure must still retry and deliver the payload. */
 static void test_nonblocking_send_retry(void)
 {
@@ -431,6 +517,8 @@ TEST_LIST = {
     { "blocking_send_timeout", test_blocking_send_timeout },
     { "blocking_send_timeout_partial", test_blocking_send_timeout_partial },
     { "nonblocking_send_retry", test_nonblocking_send_retry },
+    { "nonblocking_send_waits_for_writability",
+      test_nonblocking_send_waits_for_writability },
 #endif
     { "ipv4_client_server", test_ipv4_client_server},
     { "ipv6_client_server", test_ipv6_client_server},
