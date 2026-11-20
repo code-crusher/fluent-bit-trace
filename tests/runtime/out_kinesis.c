@@ -1,4 +1,5 @@
 /* -*- Mode: C; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4 -*- */
+#include <stdio.h>
 #include <fluent-bit.h>
 #include "flb_tests_runtime.h"
 
@@ -713,6 +714,244 @@ void flb_test_kinesis_event_size_over_limit(void)
 }
 
 /*
+ * Returns 1 if 'needle' is found in the log file, 0 if it is not, and -1 if
+ * the log file could not be opened.
+ */
+static int log_file_contains(const char *path, const char *needle)
+{
+    FILE *fp;
+    char line[4096];
+    int found = 0;
+
+    fp = fopen(path, "r");
+    if (!fp) {
+        return -1;
+    }
+
+    while (fgets(line, sizeof(line), fp) != NULL) {
+        if (strstr(line, needle) != NULL) {
+            found = 1;
+            break;
+        }
+    }
+
+    fclose(fp);
+    return found;
+}
+
+/*
+ * Helper to run a Kinesis Streams test with a custom 'max_record_size' and
+ * capture the plugin log to 'log_file'.
+ */
+static void run_kinesis_test_with_max_record_size(char *data, size_t data_len,
+                                                  const char *max_record_size,
+                                                  int simple_aggregation,
+                                                  const char *log_file)
+{
+    int ret;
+    flb_ctx_t *ctx;
+    int in_ffd;
+    int out_ffd;
+
+    setenv("FLB_KINESIS_PLUGIN_UNDER_TEST", "true", 1);
+    remove(log_file);
+
+    ctx = flb_create();
+    TEST_CHECK(ctx != NULL);
+
+    ret = flb_service_set(ctx, "Log_File", log_file, "Log_Level", "debug", NULL);
+    TEST_CHECK(ret == 0);
+
+    in_ffd = flb_input(ctx, (char *) "lib", NULL);
+    TEST_CHECK(in_ffd >= 0);
+    flb_input_set(ctx, in_ffd, "tag", "test", NULL);
+
+    out_ffd = flb_output(ctx, (char *) "kinesis_streams", NULL);
+    TEST_CHECK(out_ffd >= 0);
+    flb_output_set(ctx, out_ffd, "match", "*", NULL);
+    flb_output_set(ctx, out_ffd, "region", "us-west-2", NULL);
+    flb_output_set(ctx, out_ffd, "stream", "fluent", NULL);
+    flb_output_set(ctx, out_ffd, "max_record_size", max_record_size, NULL);
+    flb_output_set(ctx, out_ffd, "Retry_Limit", "1", NULL);
+    if (simple_aggregation) {
+        flb_output_set(ctx, out_ffd, "simple_aggregation", "On", NULL);
+    }
+
+    ret = flb_start(ctx);
+    TEST_CHECK(ret == 0);
+
+    if (ret == 0 && data) {
+        flb_lib_push(ctx, in_ffd, data, data_len);
+    }
+
+    sleep(2);
+    flb_stop(ctx);
+    flb_destroy(ctx);
+}
+
+/*
+ * A record larger than the default 1 MiB limit must be accepted and sent when
+ * 'max_record_size' is raised. This is the case reported in issue #12232.
+ */
+void flb_test_kinesis_max_record_size_above_default(void)
+{
+    char *record;
+    size_t record_len;
+    const char *log_file = "flb_test_kinesis_max_record_size.log";
+    size_t target_size = 1572864; /* 1.5 MiB, above the 1 MiB default */
+
+    TEST_CHECK(target_size > MAX_EVENT_SIZE);
+
+    record = create_large_log_event(target_size, &record_len);
+    TEST_CHECK(record != NULL);
+
+    if (record) {
+        run_kinesis_test_with_max_record_size(record, record_len,
+                                              "2097152", FLB_FALSE, log_file);
+        flb_free(record);
+
+        /* the record must not have been discarded */
+        TEST_CHECK(log_file_contains(log_file,
+                   "Discarding record which is larger than max size allowed "
+                   "by Kinesis") == 0);
+        /* and it must have been sent to the stream */
+        TEST_CHECK(log_file_contains(log_file,
+                   "Processed 1 records, sent 1 to fluent") == 1);
+
+        remove(log_file);
+    }
+}
+
+/*
+ * Same as above, but with simple aggregation enabled: the aggregation buffer
+ * must also honor the configured 'max_record_size'.
+ */
+void flb_test_kinesis_max_record_size_aggregation(void)
+{
+    char *record;
+    size_t record_len;
+    const char *log_file = "flb_test_kinesis_max_record_size_agg.log";
+    size_t target_size = 1572864; /* 1.5 MiB, above the 1 MiB default */
+
+    record = create_large_log_event(target_size, &record_len);
+    TEST_CHECK(record != NULL);
+
+    if (record) {
+        run_kinesis_test_with_max_record_size(record, record_len,
+                                              "2097152", FLB_TRUE, log_file);
+        flb_free(record);
+
+        TEST_CHECK(log_file_contains(log_file,
+                   "Discarding record which is larger than max size allowed "
+                   "by Kinesis") == 0);
+        TEST_CHECK(log_file_contains(log_file,
+                   "Processed 1 records, sent 1 to fluent") == 1);
+
+        remove(log_file);
+    }
+}
+
+/*
+ * A record larger than the configured 'max_record_size' must still be
+ * discarded, and the warning must report the configured limit.
+ */
+void flb_test_kinesis_max_record_size_over_limit(void)
+{
+    char *record;
+    size_t record_len;
+    const char *log_file = "flb_test_kinesis_max_record_size_over.log";
+
+    record = create_large_log_event(2097152, &record_len);
+    TEST_CHECK(record != NULL);
+
+    if (record) {
+        run_kinesis_test_with_max_record_size(record, record_len,
+                                              "2097152", FLB_FALSE, log_file);
+        flb_free(record);
+
+        TEST_CHECK(log_file_contains(log_file,
+                   "Discarding record which is larger than max size allowed "
+                   "by Kinesis (2097152 bytes)") == 1);
+
+        remove(log_file);
+    }
+}
+
+/*
+ * A 'max_record_size' above the Kinesis maximum (10 MiB) must be rejected
+ * at initialization.
+ */
+void flb_test_kinesis_max_record_size_invalid(void)
+{
+    int ret;
+    flb_ctx_t *ctx;
+    int in_ffd;
+    int out_ffd;
+    char value[32];
+
+    setenv("FLB_KINESIS_PLUGIN_UNDER_TEST", "true", 1);
+
+    ctx = flb_create();
+    TEST_CHECK(ctx != NULL);
+
+    in_ffd = flb_input(ctx, (char *) "lib", NULL);
+    TEST_CHECK(in_ffd >= 0);
+    flb_input_set(ctx, in_ffd, "tag", "test", NULL);
+
+    out_ffd = flb_output(ctx, (char *) "kinesis_streams", NULL);
+    TEST_CHECK(out_ffd >= 0);
+    flb_output_set(ctx, out_ffd, "match", "*", NULL);
+    flb_output_set(ctx, out_ffd, "region", "us-west-2", NULL);
+    flb_output_set(ctx, out_ffd, "stream", "fluent", NULL);
+
+    snprintf(value, sizeof(value), "%d", MAX_EVENT_SIZE_LIMIT + 1);
+    flb_output_set(ctx, out_ffd, "max_record_size", value, NULL);
+
+    ret = flb_start(ctx);
+    TEST_CHECK(ret != 0);
+
+    if (ret == 0) {
+        flb_stop(ctx);
+    }
+    flb_destroy(ctx);
+}
+
+/*
+ * A 'max_record_size' of zero must be rejected at initialization.
+ */
+void flb_test_kinesis_max_record_size_zero(void)
+{
+    int ret;
+    flb_ctx_t *ctx;
+    int in_ffd;
+    int out_ffd;
+
+    setenv("FLB_KINESIS_PLUGIN_UNDER_TEST", "true", 1);
+
+    ctx = flb_create();
+    TEST_CHECK(ctx != NULL);
+
+    in_ffd = flb_input(ctx, (char *) "lib", NULL);
+    TEST_CHECK(in_ffd >= 0);
+    flb_input_set(ctx, in_ffd, "tag", "test", NULL);
+
+    out_ffd = flb_output(ctx, (char *) "kinesis_streams", NULL);
+    TEST_CHECK(out_ffd >= 0);
+    flb_output_set(ctx, out_ffd, "match", "*", NULL);
+    flb_output_set(ctx, out_ffd, "region", "us-west-2", NULL);
+    flb_output_set(ctx, out_ffd, "stream", "fluent", NULL);
+    flb_output_set(ctx, out_ffd, "max_record_size", "0", NULL);
+
+    ret = flb_start(ctx);
+    TEST_CHECK(ret != 0);
+
+    if (ret == 0) {
+        flb_stop(ctx);
+    }
+    flb_destroy(ctx);
+}
+
+/*
  * Test event with backslash escape sequences near the size boundary.
  * Validates the plugin handles special characters correctly when the
  * record exceeds the limit.
@@ -772,5 +1011,10 @@ TEST_LIST = {
     {"event_size_at_limit", flb_test_kinesis_event_size_at_limit },
     {"event_size_over_limit", flb_test_kinesis_event_size_over_limit },
     {"event_size_with_backslash", flb_test_kinesis_event_size_with_backslash },
+    {"max_record_size_above_default", flb_test_kinesis_max_record_size_above_default },
+    {"max_record_size_aggregation", flb_test_kinesis_max_record_size_aggregation },
+    {"max_record_size_over_limit", flb_test_kinesis_max_record_size_over_limit },
+    {"max_record_size_invalid", flb_test_kinesis_max_record_size_invalid },
+    {"max_record_size_zero", flb_test_kinesis_max_record_size_zero },
     {NULL, NULL}
 };
