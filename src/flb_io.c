@@ -47,6 +47,10 @@
 #include <limits.h>
 #ifndef FLB_SYSTEM_WINDOWS
 #include <fcntl.h>
+#include <poll.h>
+#define fd_io_poll poll
+#else
+#define fd_io_poll WSAPoll
 #endif
 
 #include <monkey/mk_core.h>
@@ -317,6 +321,35 @@ static int net_io_write(struct flb_connection *connection,
     return ret;
 }
 
+/*
+ * Wait up to one second for a nonblocking descriptor to become writable.
+ * Returns 0 when the wait finished (ready or timed out) and -1 on error.
+ */
+static int fd_io_wait_writable(int fd)
+{
+    int ret;
+    struct pollfd pfd;
+
+    pfd.fd = fd;
+    pfd.events = POLLOUT;
+
+    while (1) {
+        pfd.revents = 0;
+
+        ret = fd_io_poll(&pfd, 1, 1000);
+        if (ret >= 0) {
+            return 0;
+        }
+#ifdef FLB_SYSTEM_WINDOWS
+        if (WSAGetLastError() != WSAEINTR) {
+#else
+        if (errno != EINTR) {
+#endif
+            return -1;
+        }
+    }
+}
+
 /* Retry nonblocking backpressure, but return blocking send timeouts immediately. */
 static int fd_io_write(int fd, struct sockaddr_storage *address,
                        const void *data, size_t len, size_t *out_len)
@@ -353,10 +386,16 @@ static int fd_io_write(int fd, struct sockaddr_storage *address,
                 }
 #endif
                 /*
-                 * FIXME: for now we are handling this in a very lazy way,
-                 * just sleep for a second and retry (for a max of 30 tries).
+                 * Backpressure is usually transient, so wait for the socket to
+                 * become writable instead of sleeping for a full second. The
+                 * one second upper bound and the retry limit keep the previous
+                 * worst case behavior.
                  */
-                sleep(1);
+                ret = fd_io_wait_writable(fd);
+                if (ret == -1) {
+                    return -1;
+                }
+
                 tries++;
 
                 if (tries == 30) {
