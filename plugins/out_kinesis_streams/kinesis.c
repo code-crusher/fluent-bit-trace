@@ -160,6 +160,30 @@ static int cb_kinesis_init(struct flb_output_instance *ins,
         ctx->compression = FLB_AWS_COMPRESS_NONE;
     }
 
+    /*
+     * Records are base64 encoded before they are sent, so the largest encoded
+     * record determines the minimum payload buffer size. The buffer must also
+     * fit the fixed PutRecords overhead and the stream name.
+     */
+    if (ctx->max_record_size == 0) {
+        flb_plg_error(ctx->ins, "'max_record_size' must be greater than zero");
+        goto error;
+    }
+
+    if (ctx->max_record_size > MAX_EVENT_SIZE_LIMIT) {
+        flb_plg_error(ctx->ins, "'max_record_size' (%zu bytes) exceeds the "
+                      "Kinesis maximum record size of %d bytes",
+                      ctx->max_record_size, MAX_EVENT_SIZE_LIMIT);
+        goto error;
+    }
+
+    ctx->max_b64_record_size = MAX_B64_SIZE(ctx->max_record_size);
+    ctx->payload_size = ctx->max_b64_record_size + PUT_RECORDS_SINGLE_OVERHEAD +
+                        strlen(ctx->stream_name) + 1;
+    if (ctx->payload_size < PUT_RECORDS_PAYLOAD_SIZE) {
+        ctx->payload_size = PUT_RECORDS_PAYLOAD_SIZE;
+    }
+
     tmp = flb_output_get_property("region", ins);
     if (tmp) {
         ctx->region = tmp;
@@ -336,13 +360,13 @@ static struct flush *new_flush_buffer(struct flb_kinesis *ctx, const char *tag, 
         return NULL;
     }
 
-    buf->tmp_buf = flb_malloc(sizeof(char) * PUT_RECORDS_PAYLOAD_SIZE);
+    buf->tmp_buf = flb_malloc(sizeof(char) * ctx->payload_size);
     if (!buf->tmp_buf) {
         flb_errno();
         kinesis_flush_destroy(buf);
         return NULL;
     }
-    buf->tmp_buf_size = PUT_RECORDS_PAYLOAD_SIZE;
+    buf->tmp_buf_size = ctx->payload_size;
 
     buf->events = flb_malloc(sizeof(struct kinesis_event) * MAX_EVENTS_PER_PUT);
     if (!buf->events) {
@@ -358,7 +382,7 @@ static struct flush *new_flush_buffer(struct flb_kinesis *ctx, const char *tag, 
     /* Initialize aggregation buffer if simple_aggregation is enabled */
     buf->agg_buf_initialized = FLB_FALSE;
     if (ctx->simple_aggregation) {
-        ret = flb_aws_aggregation_init(&buf->agg_buf, MAX_EVENT_SIZE);
+        ret = flb_aws_aggregation_init(&buf->agg_buf, ctx->max_record_size);
         if (ret < 0) {
             flb_plg_error(ctx->ins, "Failed to initialize aggregation buffer");
             kinesis_flush_destroy(buf);
@@ -537,6 +561,16 @@ static struct flb_config_map config_map[] = {
      0, FLB_TRUE, offsetof(struct flb_kinesis, simple_aggregation),
      "Enable simple aggregation to combine multiple records into single API calls. "
      "This reduces the number of requests and can improve throughput."
+    },
+
+    {
+     FLB_CONFIG_MAP_SIZE, "max_record_size", MAX_EVENT_SIZE_DEFAULT,
+     0, FLB_TRUE, offsetof(struct flb_kinesis, max_record_size),
+     "Maximum size of a record, in bytes, before it is base64 encoded and sent "
+     "to Kinesis. Records larger than this value are discarded. The default "
+     "matches the Kinesis default record size limit (1 MiB including the "
+     "partition key). Streams configured to support large records can raise "
+     "this up to 10 MiB, the Kinesis maximum."
     },
 
     {

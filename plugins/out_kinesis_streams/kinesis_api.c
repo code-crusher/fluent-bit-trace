@@ -227,7 +227,7 @@ static int process_event_simple_aggregation(struct flb_kinesis *ctx, struct flus
                                             ctx->log_key,
                                             ctx->time_key,
                                             ctx->time_key_format,
-                                            MAX_EVENT_SIZE);
+                                            ctx->max_record_size);
 }
 
 /*
@@ -267,7 +267,7 @@ static int process_event(struct flb_kinesis *ctx, struct flush *buf,
          * which means we ran out of space, and must send the logs
          *
          * TODO: This could also incorrectly be triggered if the record
-         * is larger than MAX_EVENT_SIZE
+         * is larger than 'max_record_size'
          */
         return 1;
     }
@@ -291,10 +291,10 @@ static int process_event(struct flb_kinesis *ctx, struct flush *buf,
     }
 
     /* is (written + 1) because we still have to append newline */
-    if ((written + 1) >= MAX_EVENT_SIZE) {
+    if ((written + 1) >= ctx->max_record_size) {
         flb_plg_warn(ctx->ins, "[size=%zu] Discarding record which is larger than "
-                     "max size allowed by Kinesis, %s", written + 1,
-                     ctx->stream_name);
+                     "max size allowed by Kinesis (%zu bytes), %s", written + 1,
+                     ctx->max_record_size, ctx->stream_name);
         return 2;
     }
 
@@ -353,10 +353,10 @@ static int process_event(struct flb_kinesis *ctx, struct flush *buf,
     }
 
     /* is (written + 1) because we still have to append newline */
-    if ((written + 1) >= MAX_EVENT_SIZE) {
+    if ((written + 1) >= ctx->max_record_size) {
         flb_plg_warn(ctx->ins, "[size=%zu] Discarding record which is larger than "
-                     "max size allowed by Kinesis, %s", written + 1,
-                     ctx->stream_name);
+                     "max size allowed by Kinesis (%zu bytes), %s", written + 1,
+                     ctx->max_record_size, ctx->stream_name);
         return 2;
     }
 
@@ -394,7 +394,7 @@ static int process_event(struct flb_kinesis *ctx, struct flush *buf,
         size_t compressed_size = 0;
         
         ret = flb_aws_compression_b64_truncate_compress(ctx->compression,
-                                                       MAX_B64_EVENT_SIZE,
+                                                       ctx->max_b64_record_size,
                                                        tmp_buf_ptr,
                                                        written,
                                                        &compressed_buf,
@@ -468,7 +468,7 @@ static int send_aggregated_record(struct flb_kinesis *ctx, struct flush *buf) {
         size_t compressed_size = 0;
         
         ret = flb_aws_compression_b64_truncate_compress(ctx->compression,
-                                                       MAX_B64_EVENT_SIZE,
+                                                       ctx->max_b64_record_size,
                                                        buf->agg_buf.agg_buf,
                                                        agg_size,
                                                        &compressed_buf,
@@ -694,14 +694,22 @@ retry_add_event:
     event = &buf->events[buf->event_index];
     event_bytes = event->len + PUT_RECORDS_PER_RECORD_LEN;
 
+    /*
+     * Batch records while the payload stays within the standard PutRecords
+     * payload size. A single record is still sent on its own when it fits the
+     * payload buffer, which is sized for one 'max_record_size' record.
+     */
     if ((buf->data_size + event_bytes) > PUT_RECORDS_PAYLOAD_SIZE) {
-        if (buf->event_index <= 0) {
+        if (buf->event_index > 0) {
+            retry_add = FLB_TRUE;
+            goto send;
+        }
+
+        if (event_bytes > ctx->payload_size) {
             flb_plg_warn(ctx->ins, "[size=%zu] Discarding massive log record, %s",
                          event_bytes, ctx->stream_name);
             return 0;
         }
-        retry_add = FLB_TRUE;
-        goto send;
     }
 
     buf->data_size += event_bytes;

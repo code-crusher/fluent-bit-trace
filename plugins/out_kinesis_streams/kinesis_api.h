@@ -22,8 +22,23 @@
 
 #define PUT_RECORDS_PAYLOAD_SIZE         10485760
 #define MAX_EVENTS_PER_PUT               500
-#define MAX_EVENT_SIZE                   1048556 /* 1048576 - 20 bytes for partition key */
-#define MAX_B64_EVENT_SIZE               1398076 /* ceil(1048556 / 3) * 4 */
+
+/*
+ * Default and maximum record sizes, before base64 encoding. Kinesis limits a
+ * record (data blob plus partition key) to 1 MiB by default, or up to 10 MiB
+ * when the stream is configured to support large records. Both values reserve
+ * 20 bytes for the partition key.
+ */
+#define MAX_EVENT_SIZE                   1048556  /* 1 MiB - 20 bytes */
+#define MAX_EVENT_SIZE_LIMIT             10485740 /* 10 MiB - 20 bytes */
+
+/* string form of the default record size, used by the config map */
+#define KINESIS_STRINGIFY_(x)            #x
+#define KINESIS_STRINGIFY(x)             KINESIS_STRINGIFY_(x)
+#define MAX_EVENT_SIZE_DEFAULT           KINESIS_STRINGIFY(MAX_EVENT_SIZE)
+
+/* number of bytes needed to base64 encode a buffer of 'size' bytes */
+#define MAX_B64_SIZE(size)               ((((size) + 2) / 3) * 4)
 
 /* number of characters needed to 'start' a PutRecords payload */
 #define PUT_RECORDS_HEADER_LEN      30
@@ -31,6 +46,11 @@
 #define PUT_RECORDS_PER_RECORD_LEN  48
 /* number of characters needed to 'end' a PutRecords payload */
 #define PUT_RECORDS_FOOTER_LEN      4
+
+/* fixed overhead of a PutRecords payload carrying a single record */
+#define PUT_RECORDS_SINGLE_OVERHEAD  (PUT_RECORDS_HEADER_LEN + \
+                                      PUT_RECORDS_PER_RECORD_LEN + \
+                                      PUT_RECORDS_FOOTER_LEN)
 
 #include "kinesis.h"
 

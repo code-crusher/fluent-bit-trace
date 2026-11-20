@@ -99,6 +99,13 @@ struct flb_kinesis {
     int retry_requests;
     int simple_aggregation;
     int compression;
+
+    /* maximum record size before base64 encoding, and its encoded size */
+    size_t max_record_size;
+    size_t max_b64_record_size;
+    /* maximum size of a PutRecords payload */
+    size_t payload_size;
+
     char *sts_endpoint;
     int custom_endpoint;
     uint16_t port;
