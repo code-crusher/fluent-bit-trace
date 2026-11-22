@@ -24,6 +24,7 @@
 #include <fluent-bit/flb_info.h>
 #include <fluent-bit/flb_str.h>
 #include <fluent-bit/flb_compat.h>
+#include <fluent-bit/flb_crypto.h>
 #include <fluent-bit/tls/flb_tls.h>
 #include <fluent-bit/tls/flb_tls_info.h>
 
@@ -705,6 +706,10 @@ static int windows_load_system_certificates(struct tls_context *ctx)
             find_type = (ctx->allowed_thumbprints[i].cbData == 20)
                          ? CERT_FIND_SHA1_HASH
                          : CERT_FIND_SHA256_HASH;
+
+            if (find_type == CERT_FIND_SHA1_HASH) {
+                flb_crypto_warn_deprecated_sha1();
+            }
 
             win_cert = NULL;
             while ((win_cert = CertFindCertificateInStore(win_store,
