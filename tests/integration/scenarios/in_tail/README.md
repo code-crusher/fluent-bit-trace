@@ -30,6 +30,7 @@ harness, not just unit or runtime-library coverage.
 - gzip static file ingestion
 - generic input encoding conversion
 - `exclude_path` filtering
+- `ignore_missing_path` for optional paths and globs
 - `ignore_older`
 - `ignore_active_older_files`
 - delayed readability after startup

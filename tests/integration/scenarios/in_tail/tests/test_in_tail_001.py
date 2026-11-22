@@ -1261,3 +1261,43 @@ def test_in_tail_discovers_file_after_permissions_are_restored(workspace):
         service.stop()
 
     assert_log_set(records, ["became-readable"])
+
+
+def test_in_tail_ignore_missing_path_discovers_optional_glob_later(workspace):
+    log_dir = workspace / "optional"
+    optional_dir = log_dir / "components" / "worker"
+    log_dir.mkdir()
+
+    service = Service(
+        "tail_ignore_missing_path.yaml",
+        tail_path=f"{log_dir}/*.log,{log_dir}/components/*/*.log",
+        db_path=workspace / "tail.db",
+    )
+
+    if not fluent_bit_input_supports_config_property(
+            "tail", "ignore_missing_path"):
+        pytest.skip(
+            "tail.ignore_missing_path is not supported by the selected Fluent Bit binary"
+        )
+
+    try:
+        service.start()
+
+        # The optional glob does not match anything yet: no error must be
+        # reported while the path keeps being re-scanned.
+        service.assert_no_new_records_for(0, quiet_period=3)
+
+        log_text = Path(service.flb.log_file).read_text(encoding="utf-8")
+        assert "error scanning path" not in log_text
+        assert "read error, check permissions" not in log_text
+
+        optional_dir.mkdir(parents=True)
+        optional_file = optional_dir / "component.log"
+        write_and_sync(optional_file, "component-line\n")
+
+        records = service.wait_for_records(1, timeout=20)
+    finally:
+        service.stop()
+
+    assert_log_set(records, ["component-line"])
+    assert records[0]["file"] == str(optional_file)
