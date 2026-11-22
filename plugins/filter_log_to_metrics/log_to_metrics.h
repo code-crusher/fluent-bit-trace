@@ -98,7 +98,6 @@ struct log_to_metrics_ctx {
     long flush_interval_sec;
     long flush_interval_nsec;
     int timer_interval;
-    int timer_mode;
     struct flb_sched_timer *timer;
     int new_data;
 };

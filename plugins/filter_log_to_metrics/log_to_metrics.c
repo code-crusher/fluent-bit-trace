@@ -815,7 +815,6 @@ static int cb_log_to_metrics_init(struct flb_filter_instance *f_ins,
         }
     }
 
-
     /* create the metric */
     ctx->cmt = NULL;
     ctx->cmt = cmt_create();
@@ -930,31 +929,46 @@ static int cb_log_to_metrics_init(struct flb_filter_instance *f_ins,
     ctx->input_ins = input_ins;
 
 
+    /*
+     * Normalize the emission interval and schedule the metric timer: the
+     * metric context is a cumulative snapshot, so it must be appended at most
+     * once per engine flush window. Appending it on every filter invocation
+     * re-emits series that were already emitted in the same window, which
+     * downstream consumers observe as duplicate series.
+     */
     if (ctx->flush_interval_sec <= 0) {
         ctx->flush_interval_sec = strtol(DEFAULT_INTERVAL_SEC, NULL, 10);
     }
     if (ctx->flush_interval_nsec <= 0) {
         ctx->flush_interval_nsec = strtol(DEFAULT_INTERVAL_NSEC, NULL, 10);
     }
+
     if (ctx->flush_interval_sec == 0 && ctx->flush_interval_nsec == 0) {
-        flb_plg_debug(ctx->ins, "Interval is set to 0, will not use timer and "
-                "send metrics immediately");
-        ctx->timer_mode = FLB_FALSE;
-        return 0;
+        /*
+         * No interval was configured: coalesce emissions on the engine flush
+         * cadence so each flush window carries at most one snapshot.
+         */
+        ctx->timer_interval = (int) (config->flush * 1000);
+        if (ctx->timer_interval <= 0) {
+            ctx->timer_interval = 1;
+        }
+        flb_plg_debug(ctx->ins, "Interval is set to 0, using the engine flush "
+                      "interval of %d ms", ctx->timer_interval);
+    }
+    else {
+        /* Convert flush_interval_sec and flush_interval_nsec to milliseconds */
+        ctx->timer_interval = (ctx->flush_interval_sec * 1000) +
+                              (ctx->flush_interval_nsec / 1000000);
+        flb_plg_debug(ctx->ins,
+                      "Creating metric timer with frequency %d ms",
+                      ctx->timer_interval);
     }
 
-    /* Initialize timer for scheduled metric updates */
     sched = flb_sched_ctx_get();
-    if(sched == 0) {
+    if (sched == NULL) {
         flb_plg_error(f_ins, "could not get scheduler context");
         return -1;
     }
-    /* Convert flush_interval_sec and flush_interval_nsec to milliseconds */
-    ctx->timer_interval = (ctx->flush_interval_sec * 1000) +
-                        (ctx->flush_interval_nsec / 1000000);
-    flb_plg_debug(ctx->ins,
-                      "Creating metric timer with frequency %d ms",
-                        ctx->timer_interval);
 
     ret = flb_sched_timer_cb_create(sched, FLB_SCHED_TIMER_CB_PERM,
                                     ctx->timer_interval, cb_send_metric_chunk,
@@ -963,7 +977,7 @@ static int cb_log_to_metrics_init(struct flb_filter_instance *f_ins,
         flb_plg_error(f_ins, "could not create timer callback");
         return -1;
     }
-    ctx->timer_mode = FLB_TRUE;
+
     return 0;
 }
 
@@ -989,6 +1003,7 @@ static int cb_log_to_metrics_filter(const void *data, size_t bytes,
     double gauge_value = 0;
     double histogram_value = 0;
     int label_count = ctx->label_counter;
+    int updated = FLB_FALSE;
 
     /* Create temporary msgpack buffer */
     msgpack_sbuffer_init(&tmp_sbuf);
@@ -1053,6 +1068,9 @@ static int cb_log_to_metrics_filter(const void *data, size_t bytes,
                 case FLB_LOG_TO_METRICS_COUNTER:
                     ret = cmt_counter_inc(ctx->c, ts, label_count,
                                     ctx->label_values);
+                    if (ret == 0) {
+                        updated = FLB_TRUE;
+                    }
                     break;
 
                 case FLB_LOG_TO_METRICS_GAUGE:
@@ -1081,6 +1099,9 @@ static int cb_log_to_metrics_filter(const void *data, size_t bytes,
 
                     ret = cmt_gauge_set(ctx->g, ts, gauge_value,
                                     label_count, ctx->label_values);
+                    if (ret == 0) {
+                        updated = FLB_TRUE;
+                    }
                     flb_ra_key_value_destroy(rval);
                     rval = NULL;
                     break;
@@ -1111,6 +1132,9 @@ static int cb_log_to_metrics_filter(const void *data, size_t bytes,
 
                     ret = cmt_histogram_observe(ctx->h, ts, histogram_value,
                                     label_count, ctx->label_values);
+                    if (ret == 0) {
+                        updated = FLB_TRUE;
+                    }
                     flb_ra_key_value_destroy(rval);
                     rval = NULL;
                     break;
@@ -1119,27 +1143,16 @@ static int cb_log_to_metrics_filter(const void *data, size_t bytes,
                     log_to_metrics_destroy(ctx);
                     return -1;
             }
-
-            if (!ctx->timer_mode) {
-                ret = flb_input_metrics_append(ctx->input_ins, ctx->tag,
-                                            strlen(ctx->tag), ctx->cmt);
-
-	            if (ret != 0) {
-                    flb_plg_error(ctx->ins, "could not append metrics. "
-                        "Please consider to use flush_interval_sec and flush_interval_nsec");
-                }
-            }
-            else {
-                if (ret == 0) {
-                    ctx->new_data = FLB_TRUE;
-                }
-            }
         }
         else if (ret == GREP_RET_EXCLUDE) {
             /* Do nothing */
         }
     }
 
+    if (updated) {
+        /* the timer callback will append the context on its next tick */
+        ctx->new_data = FLB_TRUE;
+    }
 
     if (ctx->discard_logs) {
         *out_buf = NULL;
@@ -1254,14 +1267,16 @@ static struct flb_config_map config_map[] = {
       FLB_CONFIG_MAP_INT, "flush_interval_sec", DEFAULT_INTERVAL_SEC,
       0, FLB_TRUE, offsetof(struct log_to_metrics_ctx, flush_interval_sec),
       "Set the timer interval for metrics emission. If flush_interval_sec and "
-      "flush_interval_nsec are set to 0, the timer is disabled (default)."
+      "flush_interval_nsec are set to 0 (default), metrics are emitted on "
+      "every engine flush cycle."
     },
     {
       FLB_CONFIG_MAP_INT, "flush_interval_nsec", DEFAULT_INTERVAL_NSEC,
       0, FLB_TRUE, offsetof(struct log_to_metrics_ctx, flush_interval_nsec),
-      "Set the timer interval (subseconds) for metrics emission. "
-      "If flush_interval_sec and flush_interval_nsec are set to 0, the timer is disabled "
-      "(default). Final precision is milliseconds."
+      "Set the timer interval (subseconds) for metrics emission. If "
+      "flush_interval_sec and flush_interval_nsec are set to 0 (default), "
+      "metrics are emitted on every engine flush cycle. "
+      "Final precision is milliseconds."
     },
     {
      FLB_CONFIG_MAP_BOOL, "discard_logs", "false",
