@@ -9,13 +9,17 @@
 #include "../include/flb_tests_tmpdir.h"
 #include <errno.h>
 #include <inttypes.h>
+#include <stdio.h>
 
 #ifdef FLB_SYSTEM_WINDOWS
 #include <windows.h>
 #else
 #include <dirent.h>
 #include <sys/stat.h>
+#include <unistd.h>
 #endif
+
+#include "../include/flb_tests_stderr.h"
 
 /* Test data */
 #include "data/td/json_td.h" /* JSON_TD */
@@ -462,6 +466,53 @@ static int ensure_test_directory(const char *path)
 
     return -1;
 #endif
+}
+
+static void flb_test_s3_send_content_md5_warns(void)
+{
+    int ret;
+    flb_ctx_t *ctx;
+    int in_ffd;
+    int out_ffd;
+    char log_buffer[8192];
+    struct flb_test_stderr_capture capture;
+
+    setenv("FLB_S3_PLUGIN_UNDER_TEST", "true", 1);
+
+    TEST_CHECK(flb_test_stderr_capture_start(&capture) == 0);
+
+    ctx = flb_create();
+    TEST_CHECK(ctx != NULL);
+    if (ctx == NULL) {
+        flb_test_stderr_capture_stop(&capture, log_buffer, sizeof(log_buffer));
+        unsetenv("FLB_S3_PLUGIN_UNDER_TEST");
+        return;
+    }
+
+    in_ffd = flb_input(ctx, (char *) "lib", NULL);
+    TEST_CHECK(in_ffd >= 0);
+    flb_input_set(ctx, in_ffd, "tag", "test", NULL);
+
+    out_ffd = flb_output(ctx, (char *) "s3", NULL);
+    TEST_CHECK(out_ffd >= 0);
+    flb_output_set(ctx, out_ffd, "match", "*", NULL);
+    flb_output_set(ctx, out_ffd, "region", "us-east-1", NULL);
+    flb_output_set(ctx, out_ffd, "bucket", "fluent", NULL);
+    flb_output_set(ctx, out_ffd, "send_content_md5", "true", NULL);
+    flb_output_set(ctx, out_ffd, "retry_exhausted_action", "invalid-action", NULL);
+
+    /* Configuration is intentionally invalid so the pipeline never starts. */
+    ret = flb_start(ctx);
+    TEST_CHECK(ret != 0);
+
+    flb_destroy(ctx);
+
+    flb_test_stderr_capture_stop(&capture, log_buffer, sizeof(log_buffer));
+    unsetenv("FLB_S3_PLUGIN_UNDER_TEST");
+
+    TEST_CHECK(strstr(log_buffer, "send_content_md5") != NULL);
+    TEST_CHECK(strstr(log_buffer, "deprecated") != NULL);
+    TEST_MSG("captured log: %s", log_buffer);
 }
 
 static int test_directory_exists(const char *path)
@@ -2552,6 +2603,7 @@ static void flb_test_s3_credentials_serialized(void)
 /* Test list */
 TEST_LIST = {
     {"hostname_verification_propagates", flb_test_s3_hostname_verification_propagates },
+    {"send_content_md5_warns", flb_test_s3_send_content_md5_warns },
     {"credentials_serialized", flb_test_s3_credentials_serialized },
     {"multipart_success", flb_test_s3_multipart_success },
     {"putobject_success", flb_test_s3_putobject_success },

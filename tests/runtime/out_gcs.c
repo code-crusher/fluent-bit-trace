@@ -3,6 +3,9 @@
 #include "flb_tests_runtime.h"
 #include "../include/flb_tests_tmpdir.h"
 
+#include <stdio.h>
+#include "../include/flb_tests_stderr.h"
+
 #include "data/td/json_td.h"
 #include "../../plugins/out_gcs/gcs.h"
 #include "../../plugins/out_gcs/gcs_store.h"
@@ -29,6 +32,60 @@ static char *create_test_store_directory(const char *postfix)
     }
 
     return store_dir;
+}
+
+static void flb_test_gcs_send_content_md5_warns(void)
+{
+    int ret;
+    flb_ctx_t *ctx;
+    int in_ffd;
+    int out_ffd;
+    char *store_dir;
+    char log_buffer[8192];
+    struct flb_test_stderr_capture capture;
+
+    store_dir = create_test_store_directory("/flb-gcs-test-md5-warn-XXXXXX");
+    TEST_CHECK(store_dir != NULL);
+    if (!store_dir) {
+        return;
+    }
+
+    TEST_CHECK(flb_test_stderr_capture_start(&capture) == 0);
+
+    ctx = flb_create();
+    TEST_CHECK(ctx != NULL);
+    if (ctx == NULL) {
+        flb_test_stderr_capture_stop(&capture, log_buffer, sizeof(log_buffer));
+        flb_free(store_dir);
+        return;
+    }
+
+    in_ffd = flb_input(ctx, (char *) "lib", NULL);
+    TEST_CHECK(in_ffd >= 0);
+    flb_input_set(ctx, in_ffd, "tag", "test", NULL);
+
+    out_ffd = flb_output(ctx, (char *) "gcs", NULL);
+    TEST_CHECK(out_ffd >= 0);
+    flb_output_set(ctx, out_ffd, "match", "*", NULL);
+    flb_output_set(ctx, out_ffd, "bucket", "fluent", NULL);
+    flb_output_set(ctx, out_ffd, "google_service_credentials", SERVICE_CREDENTIALS, NULL);
+    flb_output_set(ctx, out_ffd, "store_dir", store_dir, NULL);
+    flb_output_set(ctx, out_ffd, "send_content_md5", "true", NULL);
+
+    ret = flb_start(ctx);
+    TEST_CHECK(ret == 0);
+    if (ret == 0) {
+        flb_stop(ctx);
+    }
+
+    flb_destroy(ctx);
+
+    flb_test_stderr_capture_stop(&capture, log_buffer, sizeof(log_buffer));
+    flb_free(store_dir);
+
+    TEST_CHECK(strstr(log_buffer, "send_content_md5") != NULL);
+    TEST_CHECK(strstr(log_buffer, "deprecated") != NULL);
+    TEST_MSG("captured log: %s", log_buffer);
 }
 
 void flb_test_gcs_jwt_signing(void)
@@ -1866,6 +1923,7 @@ void flb_test_gcs_total_file_size_zero_disables_size_trigger(void)
 }
 
 TEST_LIST = {
+    {"send_content_md5_warns", flb_test_gcs_send_content_md5_warns},
     {"jwt_signing", flb_test_gcs_jwt_signing},
     {"net_settings_applied_to_upstream", flb_test_gcs_net_settings_applied_to_upstream},
     {"timer_upload_without_ordering_uses_sync_upstream",
