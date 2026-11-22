@@ -1132,6 +1132,14 @@ static int cb_s3_init(struct flb_output_instance *ins,
         return -1;
     }
 
+    if (ctx->send_content_md5 == FLB_TRUE) {
+        flb_plg_warn(ctx->ins,
+                     "'send_content_md5' uses MD5, which is deprecated and "
+                     "will be removed in a future release. It is retained for "
+                     "compatibility with S3 Object Lock; disable it when the "
+                     "destination no longer requires the Content-MD5 header");
+    }
+
     action = s3_get_retry_exhausted_action(ctx->retry_exhausted_action_str);
     if (action == -1) {
         flb_plg_error(ctx->ins,
