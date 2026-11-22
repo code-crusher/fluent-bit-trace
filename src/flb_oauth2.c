@@ -734,6 +734,9 @@ static int oauth2_private_key_jwt_thumbprint(const char *certificate_file,
     if (strcasecmp(header_name, "x5t#S256") == 0) {
         digest_type = EVP_sha256();
     }
+    else {
+        flb_crypto_warn_deprecated_sha1();
+    }
 
     ret = X509_digest(cert, digest_type, digest, &digest_len);
     if (ret != 1 || digest_len == 0) {
