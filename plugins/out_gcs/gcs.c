@@ -1891,6 +1891,13 @@ static int cb_gcs_init(struct flb_output_instance *ins, struct flb_config *confi
         goto error;
     }
 
+    if (ctx->send_content_md5 == FLB_TRUE) {
+        flb_plg_warn(ins,
+                     "'send_content_md5' uses MD5, which is deprecated and "
+                     "will be removed in a future release. Disable it when the "
+                     "destination no longer requires the Content-MD5 header");
+    }
+
     ctx->timer_ms = ctx->upload_timeout / 6;
     if (ctx->timer_ms >= 60) {
         ctx->timer_ms = 60000;
