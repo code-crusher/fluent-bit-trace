@@ -63,6 +63,7 @@ void flb_test_log_to_metrics_histogram(void);
 void flb_test_log_to_metrics_reg(void);
 void flb_test_log_to_metrics_empty_label_keys_regex(void);
 void flb_test_log_to_metrics_label(void);
+void flb_test_log_to_metrics_label_no_duplicates(void);
 
 
 /* Test data */
@@ -124,6 +125,7 @@ TEST_LIST = {
     {"counter_regex",          flb_test_log_to_metrics_reg                    },
     {"regex_empty_label_keys", flb_test_log_to_metrics_empty_label_keys_regex },
     {"label",                  flb_test_log_to_metrics_label                  },
+    {"label_no_duplicates",    flb_test_log_to_metrics_label_no_duplicates    },
     {NULL, NULL}
 };
 
@@ -154,6 +156,28 @@ static int buffer_contains(const char *buffer, size_t buffer_size,
     }
 
     return FLB_FALSE;
+}
+
+static size_t buffer_count(const char *buffer, size_t buffer_size,
+                           const char *needle)
+{
+    size_t offset;
+    size_t count = 0;
+    size_t needle_length;
+
+    needle_length = strlen(needle);
+
+    if (needle_length == 0 || buffer_size < needle_length) {
+        return 0;
+    }
+
+    for (offset = 0; offset + needle_length <= buffer_size; offset++) {
+        if (memcmp(buffer + offset, needle, needle_length) == 0) {
+            count++;
+        }
+    }
+
+    return count;
 }
 
 static void snapshot_output(char *out_result, size_t *out_size)
@@ -798,5 +822,94 @@ void flb_test_log_to_metrics_label(void)
         TEST_MSG("expected substring:\n%s\ngot (%lu bytes):\n%.*s\n",
                  expected_label_value, (unsigned long) finalSize, (int) finalSize, finalString);
     }
+    filter_test_destroy(ctx);
+}
+
+/*
+ * Regression test for issue #12107: two input instances feeding records
+ * with different label values through the same log_to_metrics filter must
+ * not emit duplicate series for the same label value. Before the fix, each
+ * filter invocation appended a full cumulative snapshot of the context, so
+ * consumers observed the same series (with the same timestamp) more than
+ * once per flush window.
+ */
+void flb_test_log_to_metrics_label_no_duplicates(void)
+{
+    int ret;
+    flb_ctx_t *ctx;
+    int in_ffd_1;
+    int in_ffd_2;
+    int filter_ffd;
+    int out_ffd;
+    size_t vda_count;
+    size_t vdb_count;
+    struct flb_lib_out_cb cb_data;
+    char *input_vda = "[0,{\"block_device\":\"vda\",\"used_percent\":0.01}]";
+    char *input_vdb = "[0,{\"block_device\":\"vdb\",\"used_percent\":0.01}]";
+    char finalString[32768] = "";
+    size_t finalSize = 0;
+    const char *series_vda = "\"labels\":[\"vda\"]";
+    const char *series_vdb = "\"labels\":[\"vdb\"]";
+
+    reset_output_state();
+    ctx = flb_create();
+    flb_service_set(ctx, "Flush", "1.000000000", "Grace", "1", "Log_Level",
+                    "error", NULL);
+
+    cb_data.cb = callback_test;
+    cb_data.data = NULL;
+
+    /* Two input instances, each contributing one distinct label value */
+    in_ffd_1 = flb_input(ctx, (char *) "lib", NULL);
+    TEST_CHECK(in_ffd_1 >= 0);
+    flb_input_set(ctx, in_ffd_1, "tag", "logs.node1", NULL);
+
+    in_ffd_2 = flb_input(ctx, (char *) "lib", NULL);
+    TEST_CHECK(in_ffd_2 >= 0);
+    flb_input_set(ctx, in_ffd_2, "tag", "logs.node2", NULL);
+
+    filter_ffd = flb_filter(ctx, (char *) "log_to_metrics", NULL);
+    TEST_CHECK(filter_ffd >= 0);
+    ret = flb_filter_set(ctx, filter_ffd,
+                         "Match", "*",
+                         "Tag", "test_metric",
+                         "metric_mode", "gauge",
+                         "metric_name", "used_percent",
+                         "metric_description", "Reports used percent",
+                         "metric_subsystem", "",
+                         "kubernetes_mode", "off",
+                         "value_field", "used_percent",
+                         "add_label", "block_device $block_device",
+                         NULL);
+
+    out_ffd = flb_output(ctx, (char *) "lib", (void *)&cb_data);
+    TEST_CHECK(out_ffd >= 0);
+    flb_output_set(ctx, out_ffd,
+                   "match", "test_metric",
+                   "format", "json",
+                   NULL);
+    ret = flb_start(ctx);
+    TEST_CHECK(ret == 0);
+
+    flb_lib_push(ctx, in_ffd_1, input_vda, strlen(input_vda));
+    flb_lib_push(ctx, in_ffd_2, input_vdb, strlen(input_vdb));
+
+    wait_with_timeout(3000, finalString);
+    snapshot_output(finalString, &finalSize);
+
+    vda_count = buffer_count(finalString, finalSize, series_vda);
+    vdb_count = buffer_count(finalString, finalSize, series_vdb);
+
+    if (!TEST_CHECK(vda_count == 1)) {
+        TEST_MSG("expected 1 occurrence of '%s', got %lu:\n%.*s\n",
+                 series_vda, (unsigned long) vda_count,
+                 (int) finalSize, finalString);
+    }
+    if (!TEST_CHECK(vdb_count == 1)) {
+        TEST_MSG("expected 1 occurrence of '%s', got %lu:\n%.*s\n",
+                 series_vdb, (unsigned long) vdb_count,
+                 (int) finalSize, finalString);
+    }
+
     filter_test_destroy(ctx);
 }
