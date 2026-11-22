@@ -16,12 +16,59 @@
  */
 
 #include <fluent-bit/flb_crypto.h>
+#include <fluent-bit/flb_log.h>
+#include <fluent-bit/flb_pthread.h>
 #include <openssl/bio.h>
 #include <openssl/bn.h>
 #include <openssl/rsa.h>
 #include <openssl/evp.h>
 #include <openssl/opensslv.h>
 #include <string.h>
+
+/*
+ * Legacy algorithm deprecation warnings
+ *
+ * MD5 and SHA-1 are retained only for backward compatibility with external
+ * services that still require them. A single warning per algorithm and
+ * process keeps those code paths visible without flooding the log.
+ */
+static pthread_mutex_t deprecation_warning_mutex = PTHREAD_MUTEX_INITIALIZER;
+static int md5_deprecation_warned = FLB_FALSE;
+static int sha1_deprecation_warned = FLB_FALSE;
+
+static void warn_deprecated_algorithm(const char *algorithm_name,
+                                      int *warning_emitted)
+{
+    pthread_mutex_lock(&deprecation_warning_mutex);
+
+    if (*warning_emitted == FLB_FALSE) {
+        *warning_emitted = FLB_TRUE;
+        flb_warn("[crypto] %s is deprecated and will be removed in a future "
+                 "release, use SHA-256 or stronger instead", algorithm_name);
+    }
+
+    pthread_mutex_unlock(&deprecation_warning_mutex);
+}
+
+void flb_crypto_warn_deprecated_md5(void)
+{
+    warn_deprecated_algorithm("MD5", &md5_deprecation_warned);
+}
+
+void flb_crypto_warn_deprecated_sha1(void)
+{
+    warn_deprecated_algorithm("SHA-1", &sha1_deprecation_warned);
+}
+
+void flb_crypto_deprecation_warnings_reset(void)
+{
+    pthread_mutex_lock(&deprecation_warning_mutex);
+
+    md5_deprecation_warned = FLB_FALSE;
+    sha1_deprecation_warned = FLB_FALSE;
+
+    pthread_mutex_unlock(&deprecation_warning_mutex);
+}
 
 /*
  * OpenSSL version compatibility macros
@@ -95,6 +142,7 @@ static const EVP_MD *flb_crypto_get_digest_algorithm_instance_by_id(int algorith
         algorithm = EVP_sha512();
     }
     else if (algorithm_id == FLB_HASH_MD5) {
+        flb_crypto_warn_deprecated_md5();
         algorithm = EVP_md5();
     }
     else {

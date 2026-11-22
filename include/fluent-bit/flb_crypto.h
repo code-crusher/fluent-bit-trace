@@ -125,4 +125,19 @@ int flb_crypto_verify_simple(int padding_type,
                              unsigned char *signature,
                              size_t signature_length);
 
+/*
+ * Legacy algorithms (MD5 and SHA-1) are retained only for backward
+ * compatibility with external services that mandate them. The helpers below
+ * emit a process-wide deprecation warning the first time each legacy
+ * algorithm is used; new code must use SHA-256 or stronger instead.
+ */
+void flb_crypto_warn_deprecated_md5(void);
+void flb_crypto_warn_deprecated_sha1(void);
+
+/*
+ * Clear the one-time deprecation warning state. Intended for tests that
+ * assert on the emitted warnings.
+ */
+void flb_crypto_deprecation_warnings_reset(void);
+
 #endif
