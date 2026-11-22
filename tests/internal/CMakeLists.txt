@@ -10,6 +10,7 @@ set(UNIT_TESTS_FILES
   sds_list.c
   hmac.c
   crypto.c
+  crypto_deprecation.c
   hash.c
   fips.c
   kv.c
