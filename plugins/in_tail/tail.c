@@ -605,6 +605,13 @@ static struct flb_config_map config_map[] = {
      "files matching a certain criteria, e.g: 'exclude_path *.gz,*.zip'"
     },
     {
+     FLB_CONFIG_MAP_BOOL, "ignore_missing_path", "false",
+     0, FLB_TRUE, offsetof(struct flb_tail_config, ignore_missing_path),
+     "If enabled, do not emit an error when a configured path or glob does "
+     "not exist or matches no files. The path is still re-scanned on every "
+     "refresh_interval, so files created later are discovered."
+    },
+    {
      FLB_CONFIG_MAP_STR, "key", "log",
      0, FLB_TRUE, offsetof(struct flb_tail_config, key),
      "when a message is unstructured (no parser applied), it's appended "

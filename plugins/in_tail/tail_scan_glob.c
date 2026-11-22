@@ -205,6 +205,7 @@ static int tail_scan_path(const char *path, struct flb_tail_config *ctx)
     globbuf.gl_pathv = NULL;
 
     /* Scan the given path */
+    errno = 0;
     ret = do_glob(path, GLOB_TILDE | GLOB_ERR, NULL, &globbuf);
     if (ret != 0) {
         switch (ret) {
@@ -212,6 +213,19 @@ static int tail_scan_path(const char *path, struct flb_tail_config *ctx)
             flb_plg_error(ctx->ins, "no memory space available");
             return -1;
         case GLOB_ABORTED:
+            /*
+             * Some libc implementations (e.g: glibc) abort the scan when an
+             * intermediate directory of the pattern does not exist. That is
+             * an expected condition for optional paths, so when
+             * 'ignore_missing_path' is enabled just skip the path: it is
+             * re-scanned on every 'refresh_interval' and files created later
+             * will be discovered.
+             */
+            if (ctx->ignore_missing_path &&
+                (errno == ENOENT || errno == ENOTDIR)) {
+                flb_plg_debug(ctx->ins, "cannot read info from: %s", path);
+                return 0;
+            }
             flb_plg_error(ctx->ins, "read error, check permissions: %s", path);
             return -1;
         case GLOB_NOMATCH:
