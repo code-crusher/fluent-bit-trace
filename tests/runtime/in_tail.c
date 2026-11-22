@@ -41,6 +41,7 @@ Approach for this tests is basing on filter_kubernetes tests
 #include "../../plugins/in_tail/win32/interface.h"
 #endif
 #include "flb_tests_runtime.h"
+#include "../include/flb_tests_tmpdir.h"
 
 #ifdef _WIN32
 #define fsync _commit
@@ -1632,6 +1633,190 @@ void flb_test_exclude_path()
     test_tail_ctx_destroy(ctx);
 }
 
+/*
+ * Return true when 'needle' is present in the given file.
+ */
+static int file_contains(const char *path, const char *needle)
+{
+    int ret;
+    char *buf;
+    size_t size;
+
+    ret = file_to_buf(path, &buf, &size);
+    if (ret != 0) {
+        return FLB_FALSE;
+    }
+
+    ret = (strstr(buf, needle) != NULL);
+    flb_free(buf);
+
+    return ret;
+}
+
+/*
+ * Run a tail input whose 'path' points to a glob under a directory that does
+ * not exist, writing the service log to 'log_path'. 'ignore_missing_path' is
+ * set to the given value. The number of records flushed is stored in
+ * 'output_num'.
+ */
+static int run_missing_path_case(int ignore_missing_path, char *log_path,
+                                 char *path, int *output_num)
+{
+    int ret;
+    int in_ffd;
+    int out_ffd;
+    int unused;
+    flb_ctx_t *ctx;
+    struct flb_lib_out_cb cb_data;
+
+    clear_output_num();
+
+    cb_data.cb = cb_count_msgpack;
+    cb_data.data = &unused;
+
+    ctx = flb_create();
+    if (!TEST_CHECK(ctx != NULL)) {
+        return -1;
+    }
+
+    ret = flb_service_set(ctx,
+                          "Flush", "0.5",
+                          "Grace", "1",
+                          "Log_Level", "debug",
+                          "Log_File", log_path,
+                          NULL);
+    if (!TEST_CHECK(ret == 0)) {
+        flb_destroy(ctx);
+        return -1;
+    }
+
+    in_ffd = flb_input(ctx, (char *) "tail", NULL);
+    if (!TEST_CHECK(in_ffd >= 0)) {
+        flb_destroy(ctx);
+        return -1;
+    }
+
+    ret = flb_input_set(ctx, in_ffd,
+                        "tag", "test",
+                        "path", path,
+                        "refresh_interval", "1",
+                        "ignore_missing_path",
+                        ignore_missing_path ? "true" : "false",
+                        NULL);
+    if (!TEST_CHECK(ret == 0)) {
+        flb_destroy(ctx);
+        return -1;
+    }
+
+    out_ffd = flb_output(ctx, (char *) "lib", &cb_data);
+    if (!TEST_CHECK(out_ffd >= 0)) {
+        flb_destroy(ctx);
+        return -1;
+    }
+
+    ret = flb_output_set(ctx, out_ffd,
+                         "match", "test",
+                         NULL);
+    if (!TEST_CHECK(ret == 0)) {
+        flb_destroy(ctx);
+        return -1;
+    }
+
+    ret = flb_start(ctx);
+    if (!TEST_CHECK(ret == 0)) {
+        flb_destroy(ctx);
+        return -1;
+    }
+
+    /* Give the scan callback at least one refresh cycle to run. */
+    flb_time_msleep(2500);
+
+    *output_num = get_output_num();
+
+    flb_stop(ctx);
+    flb_destroy(ctx);
+
+    return 0;
+}
+
+/*
+ * Verify that a glob whose parent directory does not exist is reported as an
+ * error by default and that the error is suppressed by 'ignore_missing_path'.
+ *
+ * The Windows scan backend does not report missing paths in the first place,
+ * so the message assertions only apply to the glob(3) based backend.
+ */
+#ifndef _WIN32
+void flb_test_ignore_missing_path()
+{
+    int ret;
+    int num;
+    char *tmpdir;
+    char default_log[PATH_MAX];
+    char ignore_log[PATH_MAX];
+    char missing_path[PATH_MAX];
+
+    tmpdir = flb_test_tmpdir_cat("/flb-in-tail-missing-path-XXXXXX");
+    if (!TEST_CHECK(tmpdir != NULL)) {
+        return;
+    }
+
+    if (!TEST_CHECK(mkdtemp(tmpdir) != NULL)) {
+        flb_free(tmpdir);
+        return;
+    }
+
+    snprintf(default_log, sizeof(default_log), "%s/default.log", tmpdir);
+    snprintf(ignore_log, sizeof(ignore_log), "%s/ignore.log", tmpdir);
+    snprintf(missing_path, sizeof(missing_path), "%s/missing/*/*.log", tmpdir);
+
+    /* Default behavior: the missing path is reported as an error */
+    ret = run_missing_path_case(FLB_FALSE, default_log, missing_path, &num);
+    if (!TEST_CHECK(ret == 0)) {
+        TEST_MSG("failed to run default case");
+        remove(default_log);
+        remove(ignore_log);
+        flb_test_rmdir(tmpdir);
+        flb_free(tmpdir);
+        return;
+    }
+
+    if (!TEST_CHECK(file_contains(default_log,
+                                  "read error, check permissions") == FLB_TRUE)) {
+        TEST_MSG("expected a scan error for a missing path by default");
+    }
+
+    if (!TEST_CHECK(num == 0)) {
+        TEST_MSG("unexpected records from a missing path. got=%d", num);
+    }
+
+    /* With ignore_missing_path enabled the error must not be reported */
+    ret = run_missing_path_case(FLB_TRUE, ignore_log, missing_path, &num);
+    if (!TEST_CHECK(ret == 0)) {
+        TEST_MSG("failed to run ignore_missing_path case");
+        remove(default_log);
+        remove(ignore_log);
+        flb_test_rmdir(tmpdir);
+        flb_free(tmpdir);
+        return;
+    }
+
+    if (!TEST_CHECK(file_contains(ignore_log,
+                                  "read error, check permissions") == FLB_FALSE)) {
+        TEST_MSG("unexpected scan error with ignore_missing_path enabled");
+    }
+
+    if (!TEST_CHECK(num == 0)) {
+        TEST_MSG("unexpected records from a missing path. got=%d", num);
+    }
+
+    remove(default_log);
+    remove(ignore_log);
+    flb_test_rmdir(tmpdir);
+    flb_free(tmpdir);
+}
+#endif
+
 #ifdef _WIN32
 static void test_windows_open_descriptor_exhaustion(int (*open_file)(const char *, int))
 {
@@ -3149,6 +3334,9 @@ TEST_LIST = {
     {"path_comma", flb_test_path_comma},
     {"path_key", flb_test_path_key},
     {"exclude_path", flb_test_exclude_path},
+#ifndef _WIN32
+    {"ignore_missing_path", flb_test_ignore_missing_path},
+#endif
 #ifdef _WIN32
     {"windows_open_descriptor_exhaustion", flb_test_windows_open_descriptor_exhaustion},
     {"windows_open_utf8_descriptor_exhaustion", flb_test_windows_open_utf8_descriptor_exhaustion},
