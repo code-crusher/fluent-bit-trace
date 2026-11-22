@@ -16,6 +16,7 @@
  */
 
 #include <fluent-bit/flb_hmac.h>
+#include <fluent-bit/flb_crypto.h>
 #include <fluent-bit/flb_mem.h>
 
 #if FLB_CRYPTO_OPENSSL_COMPAT_MODE >= 3
@@ -75,6 +76,10 @@ int flb_hmac_init(struct flb_hmac *context,
 
     if (digest_algorithm_name == NULL) {
         return FLB_CRYPTO_INVALID_ARGUMENT;
+    }
+
+    if (algorithm_id == FLB_HASH_MD5) {
+        flb_crypto_warn_deprecated_md5();
     }
 
     context->mac_algorithm = EVP_MAC_fetch(NULL, "HMAC", NULL);
@@ -169,6 +174,10 @@ int flb_hmac_init(struct flb_hmac *context,
 
     if (digest_algorithm_instance == NULL) {
         return FLB_CRYPTO_INVALID_ARGUMENT;
+    }
+
+    if (algorithm_id == FLB_HASH_MD5) {
+        flb_crypto_warn_deprecated_md5();
     }
 
 #if FLB_CRYPTO_OPENSSL_COMPAT_MODE == 0
