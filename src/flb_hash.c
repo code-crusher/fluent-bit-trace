@@ -16,6 +16,7 @@
  */
 
 #include <fluent-bit/flb_hash.h>
+#include <fluent-bit/flb_crypto.h>
 #include <openssl/bio.h>
 
 static const EVP_MD *flb_crypto_get_digest_algorithm_instance_by_id(int algorithm_id)
@@ -55,6 +56,10 @@ int flb_hash_init(struct flb_hash *context, int hash_type)
 
     if (digest_algorithm == NULL) {
         return FLB_CRYPTO_INVALID_ARGUMENT;
+    }
+
+    if (hash_type == FLB_HASH_MD5) {
+        flb_crypto_warn_deprecated_md5();
     }
 
     context->backend_context = EVP_MD_CTX_create();
