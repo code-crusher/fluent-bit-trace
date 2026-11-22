@@ -499,11 +499,13 @@ static void flb_test_s3_send_content_md5_warns(void)
     flb_output_set(ctx, out_ffd, "region", "us-east-1", NULL);
     flb_output_set(ctx, out_ffd, "bucket", "fluent", NULL);
     flb_output_set(ctx, out_ffd, "send_content_md5", "true", NULL);
-    flb_output_set(ctx, out_ffd, "retry_exhausted_action", "invalid-action", NULL);
 
-    /* Configuration is intentionally invalid so the pipeline never starts. */
+    /* No data is pushed, so the plugin only initializes and shuts down. */
     ret = flb_start(ctx);
-    TEST_CHECK(ret != 0);
+    TEST_CHECK(ret == 0);
+    if (ret == 0) {
+        flb_stop(ctx);
+    }
 
     flb_destroy(ctx);
 
